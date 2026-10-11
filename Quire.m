@@ -1162,20 +1162,34 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
           owner:self userInfo:@{@"q": @YES}]];
 }
 
-- (void)mouseMoved:(NSEvent *)e {
-    [super mouseMoved:e];
-    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
-    NSRect page = self.pageRect;
-    NSInteger h = NSPointInRect(p, page) ? [self headingAtY:p.y] : -1;
-    if (h != self.hoverHeading) { self.hoverHeading = h; self.needsDisplay = YES; }
-    if ([self gutterHeadingAt:p] >= 0) { [NSCursor.pointingHandCursor set]; return; }
+// One owner for the cursor: the text view's own I-beam rects fought the hand cursor and made it flicker.
+- (NSCursor *)cursorAt:(NSPoint)p {
+    if ([self gutterHeadingAt:p] >= 0) return NSCursor.pointingHandCursor;
     NSUInteger ci = [self charAtPoint:p];
     if (ci != NSNotFound) {
         NSTextStorage *ts = self.textStorage;
         if ([ts attribute:QTaskAttr atIndex:ci effectiveRange:NULL] || [ts attribute:QLinkAttr atIndex:ci effectiveRange:NULL] ||
             [ts attribute:QURLAttr atIndex:ci effectiveRange:NULL] || [ts attribute:QTagAttr atIndex:ci effectiveRange:NULL])
-            [NSCursor.pointingHandCursor set];
+            return NSCursor.pointingHandCursor;
     }
+    NSRect page = self.pageRect;
+    CGFloat ox = self.textContainerOrigin.x;
+    NSRect column = NSMakeRect(ox, NSMinY(page), NSMaxX(page) - ox, NSHeight(page));
+    return NSPointInRect(p, column) ? NSCursor.IBeamCursor : NSCursor.arrowCursor;
+}
+
+- (void)resetCursorRects {}
+
+- (void)cursorUpdate:(NSEvent *)e {
+    [[self cursorAt:[self convertPoint:e.locationInWindow fromView:nil]] set];
+}
+
+- (void)mouseMoved:(NSEvent *)e {
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    NSRect page = self.pageRect;
+    NSInteger h = NSPointInRect(p, page) ? [self headingAtY:p.y] : -1;
+    if (h != self.hoverHeading) { self.hoverHeading = h; self.needsDisplay = YES; }
+    [[self cursorAt:p] set];
 }
 
 - (void)mouseExited:(NSEvent *)e {
@@ -1710,6 +1724,28 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
 
 #pragma mark Styling
 
+// Folded text is collapsed two ways: hidden glyphs, and attributes that shrink every hidden line to nothing.
+static NSDictionary *FoldAttrs(void) {
+    static NSDictionary *a;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableParagraphStyle *p = [NSMutableParagraphStyle new];
+        p.minimumLineHeight = 0; p.maximumLineHeight = 0.01;
+        p.lineSpacing = 0; p.paragraphSpacing = 0; p.paragraphSpacingBefore = 0;
+        a = @{NSFontAttributeName: [NSFont systemFontOfSize:0.01], NSForegroundColorAttributeName: NSColor.clearColor,
+              NSParagraphStyleAttributeName: p};
+    });
+    return a;
+}
+
+- (void)applyFoldAttributes:(NSTextStorage *)ts {
+    NSUInteger len = ts.length;
+    for (NSValue *v in self.hidden) {
+        NSRange r = NSIntersectionRange(v.rangeValue, NSMakeRange(0, len));
+        if (r.length) [ts setAttributes:FoldAttrs() range:r];
+    }
+}
+
 - (void)restyleAll {
     NSTextStorage *ts = self.textView.textStorage;
     self.front = FrontMatter(ts.string);
@@ -1738,11 +1774,13 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     // A line inside a code block changes how far that block reaches when fences are typed; restyle the block too.
     if (!full) for (NSValue *v in self.blocks) if (NSIntersectionRange(v.rangeValue, lineRange).length) { lineRange = NSUnionRange(lineRange, v.rangeValue); }
     StyleRange(ts, full ? NSMakeRange(0, s.length) : lineRange, self.blocks, self.front);
-    self.styling = NO;
-    if (self.loading) return;
+    if (self.loading) { self.styling = NO; return; }
     // Recompute folds now, before the layout manager regenerates glyphs for the edit.
     NSArray<NSValue *> *old = self.hidden;
     [self computeStructure];
+    if (old.count != self.hidden.count) StyleRange(ts, NSMakeRange(0, s.length), self.blocks, self.front);   // a fold went away: restore its text
+    [self applyFoldAttributes:ts];
+    self.styling = NO;
     if (old.count || self.hidden.count) {
         NSMutableArray *rs = [old mutableCopy];
         [rs addObjectsFromArray:self.hidden];
@@ -1786,6 +1824,17 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
 - (void)refreshStructureInvalidating:(BOOL)force {
     NSArray<NSValue *> *old = self.hidden;
     [self computeStructure];
+    NSTextStorage *ts = self.textView.textStorage;
+    NSUInteger len = ts.length;
+    self.styling = YES;
+    [ts beginEditing];
+    for (NSValue *v in old) {   // bring back text that was folded
+        NSRange r = NSIntersectionRange(v.rangeValue, NSMakeRange(0, len));
+        if (r.length) StyleRange(ts, r, self.blocks, self.front);
+    }
+    [self applyFoldAttributes:ts];
+    [ts endEditing];
+    self.styling = NO;
     NSMutableArray *rs = [old mutableCopy];
     [rs addObjectsFromArray:self.hidden];
     [self invalidateRanges:rs all:force];
