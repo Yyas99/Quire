@@ -1541,6 +1541,22 @@ static NSString *TodayString(NSString *fmt) {
 
 @end
 
+#pragma mark - Title cell
+
+// Big serif titles overflowed the top of a plain text field cell and got clipped; this cell centres the text line itself.
+@interface QTitleCell : NSTextFieldCell
+@end
+@implementation QTitleCell
+- (NSRect)drawingRectForBounds:(NSRect)b {
+    NSRect r = [super drawingRectForBounds:b];
+    NSFont *f = self.font;
+    CGFloat lh = ceil(f.ascender - f.descender + f.leading) + 8;
+    if (lh < NSHeight(r)) { r.origin.y += floor((NSHeight(r) - lh) / 2); r.size.height = lh; }
+    return r;
+}
+- (NSRect)titleRectForBounds:(NSRect)b { return [self drawingRectForBounds:b]; }
+@end
+
 #pragma mark - Tabs
 
 @implementation QTab
@@ -1948,14 +1964,17 @@ static NSString *TodayString(NSString *fmt) {
     tv.delegate = self;
 
     NSTextField *title = [[NSTextField alloc] initWithFrame:NSMakeRect(0, kTopPad, 680, kTitleH)];
+    title.cell = [[QTitleCell alloc] initTextCell:@""];
+    title.editable = YES; title.selectable = YES;
     title.bezeled = NO; title.bordered = NO; title.drawsBackground = NO; title.focusRingType = NSFocusRingTypeNone;
     title.font = Serif(round(gBase * 2.05), YES, NO);
     title.textColor = qHead;
     title.placeholderString = @"Untitled";
     title.lineBreakMode = NSLineBreakByTruncatingTail;
     title.cell.usesSingleLineMode = YES;
-    title.cell.scrollable = YES;
+    title.cell.scrollable = NO;
     title.cell.wraps = NO;
+    title.cell.truncatesLastVisibleLine = YES;
     title.delegate = self;
     [tv addSubview:title];
     tv.titleField = title;
