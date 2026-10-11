@@ -17,11 +17,12 @@ static NSString *const kFolds       = @"folds";
 static NSString *const kCarets      = @"carets";
 static NSString *const kFontSize    = @"fontSize";
 static NSString *const kPageWidth   = @"pageWidth";
-static NSString *const kDailyFmt    = @"dailyFormat";
-static NSString *const kWeeklyFmt   = @"weeklyFormat";
+static NSString *const kDateFmt     = @"dateFormat";      // what ⌘D types
 static NSString *const kNewNoteLoc  = @"newNoteLocation";   // 0 next to current note, 1 vault root
 static NSString *const kSidebarW    = @"sidebarWidth";
 static NSString *const kSidebarHide = @"sidebarHidden";
+static NSString *const kTabs       = @"openTabs";
+static NSString *const kActiveTab  = @"activeTab";
 
 static NSUserDefaults *Defaults(void) { return NSUserDefaults.standardUserDefaults; }
 
@@ -148,6 +149,7 @@ static NSString *const QHRAttr        = @"QHR";         // horizontal rule line
 static NSString *const QQuoteAttr     = @"QQuote";      // block quote line
 static NSString *const QCodeBlockAttr = @"QCodeBlock";  // fenced code block line
 static NSString *const QHeadingAttr   = @"QHeading";    // heading level on a heading line
+static NSString *const QMarkerAttr    = @"QMarker";     // syntax hidden unless the caret is on its line
 
 #pragma mark - Interfaces
 
@@ -202,6 +204,7 @@ typedef NS_ENUM(NSInteger, QSort) { QSortNameAZ, QSortNameZA, QSortModNew, QSort
 @property (strong) NSTextField *titleField;
 - (NSRect)pageRect;
 - (void)updateGeometry;
+- (NSRect)lineRectForChar:(NSUInteger)ci used:(BOOL)used;
 @end
 
 @interface QIconButton : NSButton
@@ -221,12 +224,26 @@ typedef NS_ENUM(NSInteger, QSort) { QSortNameAZ, QSortNameZA, QSortModNew, QSort
 - (void)reloadIfChanged;
 @end
 
+@interface QTab : NSObject
+@property (copy) NSString *path;                  // nil = empty "New tab"
+@property (strong) NSMutableArray<NSString *> *back, *forward;
+@end
+
+@interface QTabBar : NSView
+@property (weak) QEditor *editor;
+@property CGFloat startX;
+- (void)refresh;
+@end
+
 @interface QEditor : NSObject <NSTextStorageDelegate, NSTextViewDelegate, NSLayoutManagerDelegate, NSTextFieldDelegate>
 @property (strong) NSView *view;
 @property (strong) QTextView *textView;
 @property (strong) NSScrollView *scroll;
 @property (strong) QCanvasView *canvas;
-@property (strong) QDragBar *topBar;
+@property (strong) QTabBar *topBar;
+@property (strong) QIconButton *sidebarButton;
+@property (strong) NSMutableArray<QTab *> *tabs;
+@property NSInteger active;
 @property (strong) NSTextField *crumb, *status;
 @property (strong) QIconButton *backButton, *forwardButton;
 @property (strong) NSView *emptyView;
@@ -255,6 +272,17 @@ typedef NS_ENUM(NSInteger, QSort) { QSortNameAZ, QSortNameZA, QSortModNew, QSort
 - (void)layoutForSidebarHidden:(BOOL)hidden;
 - (void)focusTitle;
 - (void)rememberCaret;
+- (QTab *)tab;
+- (void)newTab;
+- (void)openInNewTab:(NSString *)path;
+- (void)selectTab:(NSInteger)i;
+- (void)closeTabAt:(NSInteger)i;
+- (void)closeOtherTabs:(NSInteger)i;
+- (void)cycleTab:(NSInteger)d;
+- (void)restoreTabs;
+- (void)saveTabs;
+- (void)dropMissingTabs;
+- (void)openLink:(NSString *)target newTab:(BOOL)nt;
 - (BOOL)isHiddenChar:(NSUInteger)ci;
 @end
 
@@ -295,7 +323,6 @@ typedef NS_ENUM(NSInteger, QSort) { QSortNameAZ, QSortNameZA, QSortModNew, QSort
 - (NSString *)createNoteIn:(NSString *)dir name:(NSString *)name;
 - (NSString *)defaultNoteDir;
 - (void)toggleSidebar:(id)sender;
-- (void)openPeriodic:(NSString *)formatKey;
 @end
 
 #pragma mark - Vault
@@ -856,6 +883,7 @@ static void StyleLine(NSTextStorage *ts, NSString *s, NSRange lr, NSRange cr, NS
         [ts addAttributes:@{NSFontAttributeName: Serif(size, YES, NO), NSForegroundColorAttributeName: level >= 6 ? qBody2 : qHead,
                             NSParagraphStyleAttributeName: Para(@"h", 0, level), QHeadingAttr: @(level)} range:lr];
         Faint(ts, NSMakeRange(o, m.range.length));
+        [ts addAttribute:QMarkerAttr value:@YES range:NSMakeRange(o, m.range.length)];
         StyleInline(ts, line, o, m.range.length, size);
         return;
     }
@@ -927,7 +955,11 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
 
 - (BOOL)isOpaque { return YES; }
 
-- (CGFloat)insetX { return MAX(kPagePad + 24, floor((NSWidth(self.bounds) - self.pageWidth) / 2)); }
+// Page width 0 means full width: text runs edge to edge with a margin for the fold arrows.
+- (CGFloat)insetX {
+    if (self.pageWidth <= 0) return 64;
+    return MAX(kPagePad + 24, floor((NSWidth(self.bounds) - self.pageWidth) / 2));
+}
 
 - (NSPoint)textContainerOrigin { return NSMakePoint(self.insetX, kTopPad + kTitleH + kTitleGap); }
 
@@ -945,6 +977,7 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
 }
 
 - (NSRect)pageRect {
+    if (self.pageWidth <= 0) return NSMakeRect(-2, 0, NSWidth(self.bounds) + 4, NSHeight(self.bounds));
     CGFloat ix = self.insetX;
     CGFloat w = MAX(100, NSWidth(self.bounds) - 2 * ix);
     return NSMakeRect(ix - kPagePad, 0, w + 2 * kPagePad, NSHeight(self.bounds));
@@ -1132,34 +1165,40 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     return i;
 }
 
-- (void)mouseDown:(NSEvent *)e {
+// Clicks on fold arrows, checkboxes, links and tags. Runs from a local event monitor, because on recent
+// macOS the text view's own click handling swallows the event before -mouseDown: is ever called.
+- (BOOL)handleClick:(NSEvent *)e {
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    if (self.isHiddenOrHasHiddenAncestor || e.window != self.window || !self.window.isKeyWindow) return NO;
+    if (!NSPointInRect(p, self.visibleRect)) return NO;
+    if (self.titleField && NSPointInRect(p, self.titleField.frame)) return NO;
     NSInteger hi = [self gutterHeadingAt:p];
-    if (hi >= 0) { [self.editor toggleFoldAtHeading:hi]; return; }
+    if (hi >= 0) { [self.editor toggleFoldAtHeading:hi]; return YES; }
     NSEventModifierFlags mods = e.modifierFlags & (NSEventModifierFlagShift | NSEventModifierFlagOption | NSEventModifierFlagControl);
-    if (e.clickCount == 1 && mods == 0) {
-        NSUInteger ci = [self charAtPoint:p];
-        if (ci != NSNotFound) {
-            NSTextStorage *ts = self.textStorage;
-            NSRange r;
-            if ([ts attribute:QTaskAttr atIndex:ci effectiveRange:&r]) { [self.editor toggleTaskAt:r]; return; }
-            NSString *link = [ts attribute:QLinkAttr atIndex:ci effectiveRange:NULL];
-            if (link) { [self.editor openLink:link]; return; }
-            NSString *url = [ts attribute:QURLAttr atIndex:ci effectiveRange:NULL];
-            if (url) { [self.editor openURL:url]; return; }
-            NSString *tag = [ts attribute:QTagAttr atIndex:ci effectiveRange:NULL];
-            if (tag) { [self.editor searchTag:tag]; return; }
-        }
-    }
-    [super mouseDown:e];
+    if (e.clickCount != 1 || mods) return NO;
+    NSUInteger ci = [self charAtPoint:p];
+    if (ci == NSNotFound) return NO;
+    NSTextStorage *ts = self.textStorage;
+    NSRange r;
+    if ([ts attribute:QTaskAttr atIndex:ci effectiveRange:&r]) { [self.editor toggleTaskAt:r]; return YES; }
+    NSString *link = [ts attribute:QLinkAttr atIndex:ci effectiveRange:NULL];
+    if (link) { [self.editor openLink:link newTab:(e.modifierFlags & NSEventModifierFlagCommand) != 0]; return YES; }
+    NSString *url = [ts attribute:QURLAttr atIndex:ci effectiveRange:NULL];
+    if (url) { [self.editor openURL:url]; return YES; }
+    NSString *tag = [ts attribute:QTagAttr atIndex:ci effectiveRange:NULL];
+    if (tag) { [self.editor searchTag:tag]; return YES; }
+    return NO;
 }
 
-- (void)updateTrackingAreas {
-    [super updateTrackingAreas];
-    for (NSTrackingArea *ta in self.trackingAreas.copy) if (ta.owner == self && ta.userInfo[@"q"]) [self removeTrackingArea:ta];
-    [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
-        options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect
-          owner:self userInfo:@{@"q": @YES}]];
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    static id monitor;
+    if (monitor || !self.window) return;
+    __weak QTextView *weak = self;
+    monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown handler:^NSEvent *(NSEvent *e) {
+        QTextView *tv = weak;
+        return (tv && [tv handleClick:e]) ? nil : e;
+    }];
 }
 
 // One owner for the cursor: the text view's own I-beam rects fought the hand cursor and made it flicker.
@@ -1295,6 +1334,19 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     [self replace:sel with:out select:NSMakeRange(sel.location + ol, sel.length)];
 }
 
+static NSString *TodayString(NSString *fmt) {
+    NSDateFormatter *f = [NSDateFormatter new];
+    f.locale = [NSLocale localeWithLocaleIdentifier:@"en_AU"];
+    f.dateFormat = Trim(fmt ?: @"").length ? fmt : @"yyyy-MM-dd";
+    return [f stringFromDate:[NSDate date]] ?: @"";
+}
+
+// ⌘D: type today's date at the caret.
+- (void)insertDate:(id)sender {
+    NSString *d = TodayString([Defaults() stringForKey:kDateFmt]);
+    if (d.length) [self insertText:d replacementRange:self.selectedRange];
+}
+
 - (void)mdBold:(id)sender { [self wrapWith:@"**" close:@"**"]; }
 - (void)mdItalic:(id)sender { [self wrapWith:@"*" close:@"*"]; }
 - (void)mdStrike:(id)sender { [self wrapWith:@"~~" close:@"~~"]; }
@@ -1350,6 +1402,162 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
 
 @end
 
+#pragma mark - Tabs
+
+@implementation QTab
+- (instancetype)init {
+    if ((self = [super init])) { _back = [NSMutableArray array]; _forward = [NSMutableArray array]; }
+    return self;
+}
+@end
+
+@interface QTabBar ()
+@property NSInteger hover;
+@property BOOL hoverClose, hoverPlus;
+@end
+
+@implementation QTabBar
+
+- (instancetype)initWithFrame:(NSRect)f {
+    if ((self = [super initWithFrame:f])) _hover = -1;
+    return self;
+}
+- (BOOL)isFlipped { return YES; }
+- (BOOL)mouseDownCanMoveWindow { return NO; }
+- (void)refresh { self.needsDisplay = YES; }
+
+- (NSString *)titleOf:(QTab *)t {
+    return t.path ? [t.path.lastPathComponent stringByDeletingPathExtension] : @"New tab";
+}
+- (NSRect)tabRect:(NSInteger)i {
+    NSInteger n = (NSInteger)self.editor.tabs.count;
+    CGFloat avail = NSWidth(self.bounds) - self.startX - 44;
+    CGFloat w = floor(MIN(220, MAX(84, avail / MAX(1, n))));
+    return NSMakeRect(self.startX + i * w, 5, w, NSHeight(self.bounds) - 5);
+}
+- (NSRect)closeRect:(NSRect)t { return NSMakeRect(NSMaxX(t) - 25, NSMidY(t) - 8, 16, 16); }
+- (NSRect)plusRect {
+    NSInteger n = (NSInteger)self.editor.tabs.count;
+    NSRect last = n ? [self tabRect:n - 1] : NSMakeRect(self.startX, 5, 0, 31);
+    return NSMakeRect(NSMaxX(last) + 6, NSMidY(last) - 12, 24, 24);
+}
+
+- (void)drawRect:(NSRect)dirty {
+    [qSide setFill];
+    NSRectFill(dirty);
+    NSArray<QTab *> *tabs = self.editor.tabs;
+    NSInteger act = self.editor.active;
+    for (NSInteger i = 0; i < (NSInteger)tabs.count; i++) {
+        NSRect r = [self tabRect:i];
+        BOOL on = (i == act), hov = (i == self.hover);
+        if (on) {
+            CGFloat rad = 8;
+            NSBezierPath *p = [NSBezierPath bezierPath];
+            [p moveToPoint:NSMakePoint(NSMinX(r), NSMaxY(r))];
+            [p lineToPoint:NSMakePoint(NSMinX(r), NSMinY(r) + rad)];
+            [p appendBezierPathWithArcFromPoint:NSMakePoint(NSMinX(r), NSMinY(r)) toPoint:NSMakePoint(NSMinX(r) + rad, NSMinY(r)) radius:rad];
+            [p lineToPoint:NSMakePoint(NSMaxX(r) - rad, NSMinY(r))];
+            [p appendBezierPathWithArcFromPoint:NSMakePoint(NSMaxX(r), NSMinY(r)) toPoint:NSMakePoint(NSMaxX(r), NSMinY(r) + rad) radius:rad];
+            [p lineToPoint:NSMakePoint(NSMaxX(r), NSMaxY(r))];
+            [p closePath];
+            [qDesk setFill];
+            [p fill];
+            // Little flares where the tab meets the page, like a browser tab.
+            CGFloat f = 6;
+            [qDesk setFill];
+            NSRectFill(NSMakeRect(NSMinX(r) - f, NSMaxY(r) - f, f, f));
+            NSRectFill(NSMakeRect(NSMaxX(r), NSMaxY(r) - f, f, f));
+            [qSide setFill];
+            [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(NSMinX(r) - 2 * f, NSMaxY(r) - 2 * f, 2 * f, 2 * f)] fill];
+            [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(NSMaxX(r), NSMaxY(r) - 2 * f, 2 * f, 2 * f)] fill];
+        } else if (hov) {
+            RoundRect(NSMakeRect(NSMinX(r) + 3, NSMinY(r) + 2, NSWidth(r) - 6, NSHeight(r) - 7), 6, qSideHover);
+        } else if (i + 1 != act && i + 1 != self.hover && i + 1 < (NSInteger)tabs.count) {
+            [Hex(0x2c2c2c) setFill];
+            NSRectFill(NSMakeRect(NSMaxX(r) - 0.5, NSMidY(r) - 8, 1, 16));
+        }
+        NSMutableParagraphStyle *ps = [NSMutableParagraphStyle new];
+        ps.lineBreakMode = NSLineBreakByTruncatingTail;
+        NSDictionary *a = @{NSFontAttributeName: UIFont(12.5, on ? NSFontWeightMedium : NSFontWeightRegular),
+                            NSForegroundColorAttributeName: on ? qHead : (hov ? qBody2 : qMuted), NSParagraphStyleAttributeName: ps};
+        BOOL showClose = on || hov;
+        NSRect tr = NSMakeRect(NSMinX(r) + 14, NSMidY(r) - 8, NSWidth(r) - 14 - (showClose ? 32 : 14), 17);
+        [[self titleOf:tabs[(NSUInteger)i]] drawInRect:tr withAttributes:a];
+        if (showClose) {
+            NSRect c = [self closeRect:r];
+            if (hov && self.hoverClose) RoundRect(c, 4, Hex(0x2c2c2c));
+            NSBezierPath *x = [NSBezierPath bezierPath];
+            [x moveToPoint:NSMakePoint(NSMinX(c) + 4.5, NSMinY(c) + 4.5)]; [x lineToPoint:NSMakePoint(NSMaxX(c) - 4.5, NSMaxY(c) - 4.5)];
+            [x moveToPoint:NSMakePoint(NSMaxX(c) - 4.5, NSMinY(c) + 4.5)]; [x lineToPoint:NSMakePoint(NSMinX(c) + 4.5, NSMaxY(c) - 4.5)];
+            x.lineWidth = 1.3; x.lineCapStyle = NSLineCapStyleRound;
+            [(hov && self.hoverClose ? qText : qMuted) setStroke];
+            [x stroke];
+        }
+    }
+    NSRect pr = [self plusRect];
+    if (self.hoverPlus) RoundRect(pr, 6, qSideHover);
+    NSBezierPath *plus = [NSBezierPath bezierPath];
+    [plus moveToPoint:NSMakePoint(NSMidX(pr), NSMidY(pr) - 6)]; [plus lineToPoint:NSMakePoint(NSMidX(pr), NSMidY(pr) + 6)];
+    [plus moveToPoint:NSMakePoint(NSMidX(pr) - 6, NSMidY(pr))]; [plus lineToPoint:NSMakePoint(NSMidX(pr) + 6, NSMidY(pr))];
+    plus.lineWidth = 1.4; plus.lineCapStyle = NSLineCapStyleRound;
+    [(self.hoverPlus ? qText : qMuted) setStroke];
+    [plus stroke];
+}
+
+- (NSInteger)tabAt:(NSPoint)p {
+    for (NSInteger i = 0; i < (NSInteger)self.editor.tabs.count; i++) if (NSPointInRect(p, [self tabRect:i])) return i;
+    return -1;
+}
+
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea *ta in self.trackingAreas.copy) [self removeTrackingArea:ta];
+    [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
+        options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect owner:self userInfo:nil]];
+}
+- (void)mouseMoved:(NSEvent *)e {
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    NSInteger h = [self tabAt:p];
+    BOOL hc = h >= 0 && NSPointInRect(p, NSInsetRect([self closeRect:[self tabRect:h]], -2, -2));
+    BOOL hp = NSPointInRect(p, [self plusRect]);
+    if (h != self.hover || hc != self.hoverClose || hp != self.hoverPlus) {
+        self.hover = h; self.hoverClose = hc; self.hoverPlus = hp; self.needsDisplay = YES;
+    }
+}
+- (void)mouseExited:(NSEvent *)e { self.hover = -1; self.hoverClose = self.hoverPlus = NO; self.needsDisplay = YES; }
+
+- (void)mouseDown:(NSEvent *)e {
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    if (NSPointInRect(p, [self plusRect])) { [self.editor newTab]; return; }
+    NSInteger i = [self tabAt:p];
+    if (i >= 0) {
+        BOOL closeShown = (i == self.editor.active || i == self.hover);
+        if (closeShown && NSPointInRect(p, NSInsetRect([self closeRect:[self tabRect:i]], -2, -2))) [self.editor closeTabAt:i];
+        else [self.editor selectTab:i];
+        self.needsDisplay = YES;
+        return;
+    }
+    if (e.clickCount == 2) { [self.editor newTab]; return; }
+    [self.window performWindowDragWithEvent:e];
+}
+- (void)otherMouseDown:(NSEvent *)e {   // middle-click closes
+    NSInteger i = [self tabAt:[self convertPoint:e.locationInWindow fromView:nil]];
+    if (i >= 0) [self.editor closeTabAt:i];
+}
+- (NSMenu *)menuForEvent:(NSEvent *)e {
+    NSInteger i = [self tabAt:[self convertPoint:e.locationInWindow fromView:nil]];
+    if (i < 0) return nil;
+    NSMenu *m = [[NSMenu alloc] initWithTitle:@""];
+    NSMenuItem *a = [m addItemWithTitle:@"Close" action:@selector(menuClose:) keyEquivalent:@""];
+    a.target = self; a.tag = i;
+    NSMenuItem *b = [m addItemWithTitle:@"Close Others" action:@selector(menuCloseOthers:) keyEquivalent:@""];
+    b.target = self; b.tag = i;
+    return m;
+}
+- (void)menuClose:(NSMenuItem *)it { [self.editor closeTabAt:it.tag]; }
+- (void)menuCloseOthers:(NSMenuItem *)it { [self.editor closeOtherTabs:it.tag]; }
+@end
+
 #pragma mark - Editor
 
 @interface QEditor ()
@@ -1358,8 +1566,8 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
 @property BOOL styling, loading;
 @property (strong) NSTimer *saveTimer;
 @property (strong) NSDate *savedMtime;
-@property (strong) NSMutableArray<NSString *> *back, *forward;
-@property NSUInteger words;
+@property NSUInteger words, chars;
+@property NSRange activeLine;   // the caret's line, where hidden syntax shows
 @property BOOL readOnly;
 @end
 
@@ -1370,7 +1578,8 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     _folded = [NSMutableSet set];
     _headings = @[]; _hidden = @[]; _blocks = @[];
     _front = NSMakeRange(NSNotFound, 0);
-    _back = [NSMutableArray array]; _forward = [NSMutableArray array];
+    _tabs = [NSMutableArray arrayWithObject:[QTab new]];
+    _active = 0;
     [self buildViews];
     return self;
 }
@@ -1384,12 +1593,15 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     self.view = v;
 
     // Top bar: back, forward, where you are.
-    QDragBar *bar = [[QDragBar alloc] initWithFrame:NSMakeRect(0, 0, 900, 40)];
+    QTabBar *bar = [[QTabBar alloc] initWithFrame:NSMakeRect(0, 0, 900, 36)];
+    bar.editor = self;
     self.topBar = bar;
+    self.sidebarButton = [QIconButton symbol:@"sidebar.left" size:14 tip:@"Show sidebar (⌘\\)" target:nil action:@selector(toggleSidebar:)];
+    [bar addSubview:self.sidebarButton];
     self.backButton = [QIconButton symbol:@"chevron.left" size:12 tip:@"Back (⌘[)" target:self action:@selector(goBack)];
     self.forwardButton = [QIconButton symbol:@"chevron.right" size:12 tip:@"Forward (⌘])" target:self action:@selector(goForward)];
     self.crumb = Label(@"", UIFont(12, NSFontWeightRegular), qMuted);
-    [bar addSubview:self.backButton]; [bar addSubview:self.forwardButton]; [bar addSubview:self.crumb];
+    [bar addSubview:self.backButton]; [bar addSubview:self.forwardButton];
     [v addSubview:bar];
 
     // The page.
@@ -1417,7 +1629,7 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     QTextView *tv = [[QTextView alloc] initWithFrame:NSMakeRect(0, 0, 900, 660) textContainer:tc];
     tv.editor = self;
     tv.hoverHeading = -1;
-    tv.pageWidth = [Defaults() doubleForKey:kPageWidth] ?: 680;
+    tv.pageWidth = [Defaults() doubleForKey:kPageWidth];
     tv.minSize = NSMakeSize(0, 660);
     tv.maxSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
     tv.verticallyResizable = YES;
@@ -1492,10 +1704,15 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     BOOL flipped = self.view.isFlipped;
     NSRect barRect = flipped ? NSMakeRect(0, 0, NSWidth(b), barH) : NSMakeRect(0, NSHeight(b) - barH, NSWidth(b), barH);
     self.topBar.frame = barRect;
-    CGFloat left = gApp.sidebarHidden ? 82 : 14;
-    self.backButton.frame = NSMakeRect(left, 1, 26, 26);
-    self.forwardButton.frame = NSMakeRect(left + 26, 1, 26, 26);
-    self.crumb.frame = NSMakeRect(left + 62, 6, MAX(50, NSWidth(b) - left - 80), 16);
+    BOOL hidden = gApp.sidebarHidden;
+    CGFloat left = hidden ? 80 : 10;
+    self.sidebarButton.hidden = !hidden;
+    self.sidebarButton.frame = NSMakeRect(left, 5, 30, 26);
+    if (hidden) left += 34;
+    self.backButton.frame = NSMakeRect(left, 5, 26, 26);
+    self.forwardButton.frame = NSMakeRect(left + 26, 5, 26, 26);
+    self.topBar.startX = left + 62;
+    [self.topBar refresh];
     NSRect body = flipped ? NSMakeRect(0, barH, NSWidth(b), NSHeight(b) - barH) : NSMakeRect(0, 0, NSWidth(b), NSHeight(b) - barH);
     self.scroll.frame = body;
     self.canvas.frame = body;
@@ -1514,7 +1731,6 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     self.scroll.hidden = empty || [self isCanvasPath:self.path];
     self.canvas.hidden = empty || ![self isCanvasPath:self.path];
     self.status.hidden = empty;
-    self.backButton.hidden = self.forwardButton.hidden = empty && !self.back.count;
 }
 
 - (BOOL)isCanvasPath:(NSString *)p { return [p.pathExtension.lowercaseString isEqualToString:@"canvas"]; }
@@ -1523,7 +1739,7 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     gBase = [Defaults() doubleForKey:kFontSize] ?: 17;
     [gFontCache removeAllObjects];
     [gParaCache removeAllObjects];
-    self.textView.pageWidth = [Defaults() doubleForKey:kPageWidth] ?: 680;
+    self.textView.pageWidth = [Defaults() doubleForKey:kPageWidth];
     self.textView.titleField.font = Serif(round(gBase * 2.05), YES, NO);
     self.textView.typingAttributes = @{NSFontAttributeName: Serif(gBase, NO, NO), NSForegroundColorAttributeName: qText,
                                        NSParagraphStyleAttributeName: Para(@"body", 0, 0)};
@@ -1537,13 +1753,21 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
 
 - (void)openPath:(NSString *)path history:(BOOL)h {
     path = path.stringByStandardizingPath;
-    if (!path || [path isEqualToString:self.path]) { [gApp.sidebar revealPath:path]; return; }
+    if (!path) return;
+    if ([path isEqualToString:self.path]) {
+        self.tab.path = path;
+        [self updateCrumb];
+        [self saveTabs];
+        [gApp.sidebar revealPath:path];
+        return;
+    }
     if (![NSFileManager.defaultManager fileExistsAtPath:path]) { NSBeep(); return; }
     if (self.textView.titleField.currentEditor) [self.view.window makeFirstResponder:self.textView];   // commits a rename first
     [self saveNow];
     [self rememberCaret];
-    if (h && self.path) { [self.back addObject:self.path]; [self.forward removeAllObjects]; }
+    if (h && self.tab.path) { [self.tab.back addObject:self.tab.path]; [self.tab.forward removeAllObjects]; }
     self.path = path;
+    self.tab.path = path;
 
     if ([self isCanvasPath:path]) {
         self.textView.titleField.stringValue = [path.lastPathComponent stringByDeletingPathExtension];
@@ -1558,7 +1782,7 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     }
     [self updateCrumb];
     [self updateStatus];
-    [Defaults() setObject:[gApp.vault rel:path] forKey:kLastNote];
+    [self saveTabs];
     [gApp.sidebar revealPath:path];
 }
 
@@ -1582,6 +1806,7 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     [self refreshStructureInvalidating:YES];
     self.textView.titleField.stringValue = [self.path.lastPathComponent stringByDeletingPathExtension];
     self.words = WordCount(text);
+    self.chars = text.length;
 }
 
 - (void)reloadFromDisk {
@@ -1596,8 +1821,17 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
 }
 
 - (void)closeNote {
+    [self clearEditor];
+    self.tab.path = nil;
+    [self updateCrumb];
+    [self saveTabs];
+}
+
+// Empty the page without touching tabs.
+- (void)clearEditor {
     if (self.textView.titleField.currentEditor) [self.view.window makeFirstResponder:self.textView];
     [self saveNow];
+    [self rememberCaret];
     self.path = nil;
     NSTextStorage *ts = self.textView.textStorage;
     self.loading = YES;
@@ -1605,7 +1839,6 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     self.loading = NO;
     [self.textView.undoManager removeAllActions];
     self.headings = @[]; self.hidden = @[];
-    self.crumb.stringValue = @"";
     [self showEmpty:YES];
 }
 
@@ -1645,6 +1878,7 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     self.dirty = NO;
     [QIndex forget:self.path];
     self.words = WordCount(text);
+    self.chars = text.length;
     [self updateStatus];
 }
 
@@ -1659,7 +1893,21 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     [self reloadFromDisk];
 }
 
+static NSString *MovedPath(NSString *p, NSString *from, NSString *to) {
+    if (!p) return nil;
+    if ([p isEqualToString:from]) return to;
+    if ([p hasPrefix:[from stringByAppendingString:@"/"]]) return [to stringByAppendingString:[p substringFromIndex:from.length]];
+    return p;
+}
+
 - (void)pathMoved:(NSString *)from to:(NSString *)to {
+    for (QTab *t in self.tabs) {
+        t.path = MovedPath(t.path, from, to);
+        for (NSMutableArray *list in @[t.back, t.forward])
+            for (NSUInteger i = 0; i < list.count; i++) list[i] = MovedPath(list[i], from, to);
+    }
+    [self saveTabs];
+    [self.topBar refresh];
     if (!self.path) return;
     if ([self.path isEqualToString:from]) self.path = to;
     else if ([self.path hasPrefix:[from stringByAppendingString:@"/"]])
@@ -1668,26 +1916,12 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     if ([self isCanvasPath:self.path]) self.canvas.path = self.path;
     self.textView.titleField.stringValue = [self.path.lastPathComponent stringByDeletingPathExtension];
     [self updateCrumb];
-    [Defaults() setObject:[gApp.vault rel:self.path] forKey:kLastNote];
 }
 
 - (void)updateCrumb {
-    if (!self.path) { self.crumb.stringValue = @""; return; }
-    NSString *rel = Pretty([gApp.vault rel:self.path]);
-    NSArray *parts = [rel componentsSeparatedByString:@"/"];
-    NSMutableAttributedString *a = [NSMutableAttributedString new];
-    NSDictionary *dim = @{NSFontAttributeName: UIFont(12, NSFontWeightRegular), NSForegroundColorAttributeName: qMuted};
-    NSDictionary *hi = @{NSFontAttributeName: UIFont(12, NSFontWeightMedium), NSForegroundColorAttributeName: qBody2};
-    for (NSUInteger i = 0; i < parts.count; i++) {
-        BOOL last = i + 1 == parts.count;
-        NSString *p = [self isCanvasPath:self.path] && last ? [parts[i] stringByDeletingPathExtension] : parts[i];
-        [a appendAttributedString:[[NSAttributedString alloc] initWithString:p attributes:last ? hi : dim]];
-        if (!last) [a appendAttributedString:[[NSAttributedString alloc] initWithString:@"  /  " attributes:dim]];
-    }
-    self.crumb.attributedStringValue = a;
-    self.backButton.enabled = self.back.count > 0;
-    self.forwardButton.enabled = self.forward.count > 0;
-    self.backButton.hidden = self.forwardButton.hidden = NO;
+    [self.topBar refresh];
+    self.backButton.enabled = self.tab.back.count > 0;
+    self.forwardButton.enabled = self.tab.forward.count > 0;
 }
 
 - (void)updateStatus {
@@ -1697,8 +1931,10 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
         self.status.stringValue = [NSString stringWithFormat:@"%lu card%@", (unsigned long)n, n == 1 ? @"" : @"s"];
         return;
     }
-    self.status.stringValue = [NSString stringWithFormat:@"%lu word%@%@", (unsigned long)self.words, self.words == 1 ? @"" : @"s",
-                               self.dirty ? @"" : @"  ·  saved"];
+    NSNumberFormatter *nf = [NSNumberFormatter new];
+    nf.numberStyle = NSNumberFormatterDecimalStyle;
+    self.status.stringValue = [NSString stringWithFormat:@"%@ word%@   %@ characters", [nf stringFromNumber:@(self.words)],
+                               self.words == 1 ? @"" : @"s", [nf stringFromNumber:@(self.chars)]];
 }
 
 #pragma mark Caret memory
@@ -1732,7 +1968,7 @@ static NSDictionary *FoldAttrs(void) {
         NSMutableParagraphStyle *p = [NSMutableParagraphStyle new];
         p.minimumLineHeight = 0; p.maximumLineHeight = 0.01;
         p.lineSpacing = 0; p.paragraphSpacing = 0; p.paragraphSpacingBefore = 0;
-        a = @{NSFontAttributeName: [NSFont systemFontOfSize:0.01], NSForegroundColorAttributeName: NSColor.clearColor,
+        a = @{NSFontAttributeName: [NSFont systemFontOfSize:1], NSForegroundColorAttributeName: NSColor.clearColor,
               NSParagraphStyleAttributeName: p};
     });
     return a;
@@ -1863,6 +2099,7 @@ static NSDictionary *FoldAttrs(void) {
         else if (ci < s.length) {
             unichar c = [s characterAtIndex:ci];
             if ((c == '-' || c == '*' || c == '+') && [ts attribute:QBulletAttr atIndex:ci effectiveRange:NULL]) touch = YES;
+            else if ((c == '#' || c == ' ' || c == '\t') && [ts attribute:QMarkerAttr atIndex:ci effectiveRange:NULL]) touch = YES;
         }
     }
     if (!touch) return 0;
@@ -1876,6 +2113,10 @@ static NSDictionary *FoldAttrs(void) {
     for (NSUInteger i = 0; i < n; i++) {
         NSUInteger ci = charIndexes[i];
         if ([self isHiddenChar:ci]) { p[i] = NSGlyphPropertyNull; continue; }
+        if (ci < s.length && !NSLocationInRange(ci, self.activeLine) && [ts attribute:QMarkerAttr atIndex:ci effectiveRange:NULL]) {
+            p[i] = NSGlyphPropertyNull;   // "### " disappears until the caret is on this line
+            continue;
+        }
         if (ci < s.length && bulletGlyph) {
             unichar c = [s characterAtIndex:ci];
             if ((c == '-' || c == '*' || c == '+') && [ts attribute:QBulletAttr atIndex:ci effectiveRange:NULL]) g[i] = bulletGlyph;
@@ -1920,11 +2161,33 @@ static NSDictionary *FoldAttrs(void) {
     self.textView.needsDisplay = YES;
 }
 
+// Run a fold change without the page jumping: the heading stays where it was on screen.
+- (void)keepHeading:(QHeading *)h steady:(void (^)(void))change {
+    NSClipView *clip = self.scroll.contentView;
+    NSRect before = [self.textView lineRectForChar:h.line.location used:NO];
+    CGFloat offset = NSMinY(before) - NSMinY(clip.bounds);
+    NSUInteger anchor = h.line.location;
+    change();
+    void (^restore)(void) = ^{
+        NSLayoutManager *lm = self.textView.layoutManager;
+        [lm ensureLayoutForCharacterRange:NSMakeRange(0, MIN(self.textView.string.length, anchor + 1))];
+        NSRect after = [self.textView lineRectForChar:anchor used:NO];
+        CGFloat maxY = MAX(0, NSHeight(self.textView.frame) - NSHeight(clip.bounds));
+        [clip scrollToPoint:NSMakePoint(0, MIN(maxY, MAX(0, NSMinY(after) - offset)))];
+        [self.scroll reflectScrolledClipView:clip];
+    };
+    restore();
+    dispatch_async(dispatch_get_main_queue(), restore);   // again after AppKit's own post-edit scrolling
+}
+
 - (void)toggleFoldAtHeading:(NSInteger)i {
     if (i < 0 || (NSUInteger)i >= self.headings.count) return;
     QHeading *h = self.headings[(NSUInteger)i];
-    [self setFold:![self.folded containsObject:h.key] forHeading:h];
-    [self afterFoldChange];
+    [self keepHeading:h steady:^{
+        [self setFold:![self.folded containsObject:h.key] forHeading:h];
+        [self afterFoldChange];
+    }];
+
 }
 
 - (QHeading *)headingAtCaret {
@@ -1966,7 +2229,27 @@ static NSDictionary *FoldAttrs(void) {
     return YES;
 }
 
+- (void)updateActiveLine {
+    NSString *s = self.textView.string;
+    NSRange sel = self.textView.selectedRange;
+    NSRange line = s.length ? [s lineRangeForRange:NSMakeRange(MIN(sel.location, s.length), 0)] : NSMakeRange(0, 0);
+    if (sel.length) line = [s lineRangeForRange:NSIntersectionRange(sel, NSMakeRange(0, s.length))];
+    if (NSEqualRanges(line, self.activeLine)) return;
+    NSRange old = self.activeLine;
+    self.activeLine = line;
+    NSLayoutManager *lm = self.textView.layoutManager;
+    NSUInteger len = s.length;
+    for (NSValue *v in @[[NSValue valueWithRange:old], [NSValue valueWithRange:line]]) {
+        NSRange r = NSIntersectionRange(v.rangeValue, NSMakeRange(0, len));
+        if (!r.length) continue;
+        [lm invalidateGlyphsForCharacterRange:r changeInLength:0 actualCharacterRange:NULL];
+        [lm invalidateLayoutForCharacterRange:r actualCharacterRange:NULL];
+    }
+    self.textView.needsDisplay = YES;
+}
+
 - (void)textViewDidChangeSelection:(NSNotification *)n {
+    [self updateActiveLine];
     NSRange sel = self.textView.selectedRange;
     if (!self.hidden.count) return;
     BOOL changed = NO;
@@ -2033,13 +2316,15 @@ static NSDictionary *FoldAttrs(void) {
 
 #pragma mark Links, tags, tasks
 
-- (void)openLink:(NSString *)target {
+- (void)openLink:(NSString *)target { [self openLink:target newTab:NO]; }
+
+- (void)openLink:(NSString *)target newTab:(BOOL)nt {
     QNode *n = [gApp.vault resolve:target];
     NSString *heading = nil;
     NSRange hash = [target rangeOfString:@"#"];
     if (hash.location != NSNotFound) heading = Trim([target substringFromIndex:hash.location + 1]);
     if (n) {
-        [self openPath:n.path];
+        if (nt) [self openInNewTab:n.path]; else [self openPath:n.path];
     } else {
         NSString *name = target;
         NSRange cut = [name rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"|#^"]];
@@ -2106,11 +2391,12 @@ static NSDictionary *FoldAttrs(void) {
 #pragma mark History
 
 - (void)goBack {
-    while (self.back.count) {
-        NSString *p = self.back.lastObject;
-        [self.back removeLastObject];
+    QTab *t = self.tab;
+    while (t.back.count) {
+        NSString *p = t.back.lastObject;
+        [t.back removeLastObject];
         if (![NSFileManager.defaultManager fileExistsAtPath:p]) continue;
-        if (self.path) [self.forward addObject:self.path];
+        if (t.path) [t.forward addObject:t.path];
         [self openPath:p history:NO];
         return;
     }
@@ -2118,15 +2404,144 @@ static NSDictionary *FoldAttrs(void) {
 }
 
 - (void)goForward {
-    while (self.forward.count) {
-        NSString *p = self.forward.lastObject;
-        [self.forward removeLastObject];
+    QTab *t = self.tab;
+    while (t.forward.count) {
+        NSString *p = t.forward.lastObject;
+        [t.forward removeLastObject];
         if (![NSFileManager.defaultManager fileExistsAtPath:p]) continue;
-        if (self.path) [self.back addObject:self.path];
+        if (t.path) [t.back addObject:t.path];
         [self openPath:p history:NO];
         return;
     }
     NSBeep();
+}
+
+#pragma mark Tabs
+
+- (QTab *)tab {
+    if (self.active < 0 || self.active >= (NSInteger)self.tabs.count) self.active = 0;
+    if (!self.tabs.count) [self.tabs addObject:[QTab new]];
+    return self.tabs[(NSUInteger)self.active];
+}
+
+- (void)saveTabs {
+    if (!gApp.vault) return;
+    NSMutableArray *rels = [NSMutableArray array];
+    for (QTab *t in self.tabs) [rels addObject:t.path ? [gApp.vault rel:t.path] : @""];
+    [Defaults() setObject:rels forKey:kTabs];
+    [Defaults() setInteger:self.active forKey:kActiveTab];
+    if (self.tab.path) [Defaults() setObject:[gApp.vault rel:self.tab.path] forKey:kLastNote];
+}
+
+// Show whatever the active tab holds.
+- (void)showTab {
+    NSString *p = self.tab.path;
+    if (p && [NSFileManager.defaultManager fileExistsAtPath:p]) {
+        [self openPath:p history:NO];
+    } else {
+        self.tab.path = nil;
+        [self clearEditor];
+        [self updateCrumb];
+        [self saveTabs];
+    }
+    [self.topBar refresh];
+}
+
+- (void)restoreTabs {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableArray *list = [NSMutableArray array];
+    for (NSString *rel in [Defaults() arrayForKey:kTabs] ?: @[]) {
+        if (![rel isKindOfClass:NSString.class]) continue;
+        QTab *t = [QTab new];
+        if (rel.length) {
+            NSString *p = [gApp.vault.root stringByAppendingPathComponent:rel];
+            if (![fm fileExistsAtPath:p]) continue;
+            t.path = p;
+        }
+        [list addObject:t];
+    }
+    if (!list.count) {   // first run with tabs: start from the last note
+        QTab *t = [QTab new];
+        NSString *last = [Defaults() stringForKey:kLastNote];
+        NSString *p = last.length ? [gApp.vault.root stringByAppendingPathComponent:last] : nil;
+        if (p && [fm fileExistsAtPath:p]) t.path = p;
+        [list addObject:t];
+    }
+    self.tabs = list;
+    NSInteger a = [Defaults() integerForKey:kActiveTab];
+    self.active = (a >= 0 && a < (NSInteger)list.count) ? a : 0;
+    [self showTab];
+}
+
+- (void)newTab {
+    [self saveNow];
+    [self rememberCaret];
+    [self.tabs insertObject:[QTab new] atIndex:(NSUInteger)self.active + 1];
+    self.active += 1;
+    [self clearEditor];
+    [self updateCrumb];
+    [self saveTabs];
+}
+
+- (void)openInNewTab:(NSString *)path {
+    if (!path) return;
+    [self saveNow];
+    [self rememberCaret];
+    [self.tabs insertObject:[QTab new] atIndex:(NSUInteger)self.active + 1];
+    self.active += 1;
+    [self openPath:path history:NO];
+    [self.topBar refresh];
+}
+
+- (void)selectTab:(NSInteger)i {
+    if (i < 0 || i >= (NSInteger)self.tabs.count || i == self.active) return;
+    [self saveNow];
+    [self rememberCaret];
+    self.active = i;
+    [self showTab];
+}
+
+- (void)closeTabAt:(NSInteger)i {
+    if (i < 0 || i >= (NSInteger)self.tabs.count) return;
+    if (self.tabs.count == 1) { [self closeNote]; return; }   // the last tab becomes an empty one
+    BOOL wasActive = (i == self.active);
+    if (wasActive) { [self saveNow]; [self rememberCaret]; }
+    [self.tabs removeObjectAtIndex:(NSUInteger)i];
+    if (i < self.active) self.active -= 1;
+    if (self.active >= (NSInteger)self.tabs.count) self.active = (NSInteger)self.tabs.count - 1;
+    if (wasActive) [self showTab];
+    else { [self saveTabs]; [self.topBar refresh]; }
+}
+
+- (void)closeOtherTabs:(NSInteger)i {
+    if (i < 0 || i >= (NSInteger)self.tabs.count) return;
+    QTab *keep = self.tabs[(NSUInteger)i];
+    BOOL same = (i == self.active);
+    if (!same) { [self saveNow]; [self rememberCaret]; }
+    self.tabs = [NSMutableArray arrayWithObject:keep];
+    self.active = 0;
+    if (same) { [self saveTabs]; [self.topBar refresh]; }
+    else [self showTab];
+}
+
+- (void)cycleTab:(NSInteger)d {
+    NSInteger n = (NSInteger)self.tabs.count;
+    if (n < 2) return;
+    [self selectTab:((self.active + d) % n + n) % n];
+}
+
+// Files that vanished (trash, rename elsewhere) leave their tabs.
+- (void)dropMissingTabs {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (NSInteger i = (NSInteger)self.tabs.count - 1; i >= 0; i--) {
+        QTab *t = self.tabs[(NSUInteger)i];
+        if (!t.path || [fm fileExistsAtPath:t.path]) continue;
+        if (i == self.active) { [self closeNote]; continue; }
+        if (self.tabs.count > 1) { [self.tabs removeObjectAtIndex:(NSUInteger)i]; if (i < self.active) self.active -= 1; }
+        else t.path = nil;
+    }
+    [self saveTabs];
+    [self.topBar refresh];
 }
 
 @end
@@ -2503,6 +2918,8 @@ static NSDictionary *FoldAttrs(void) {
     if (n.isDir) {
         if ([self.outline isItemExpanded:n]) [self.outline.animator collapseItem:n];
         else [self.outline.animator expandItem:n];
+    } else if (NSApp.currentEvent.modifierFlags & NSEventModifierFlagCommand) {
+        [gApp.editor openInNewTab:n.path];
     } else {
         [gApp.editor openPath:n.path];
     }
@@ -2899,7 +3316,8 @@ static NSDictionary *FoldAttrs(void) {
     if (i >= self.items.count) return;
     QResult *r = self.items[i];
     if (r.tag) { self.searchField.stringValue = [@"#" stringByAppendingString:r.tag]; [self runSearch]; return; }
-    [gApp.editor openPath:r.node.path];
+    if (NSApp.currentEvent.modifierFlags & NSEventModifierFlagCommand) [gApp.editor openInNewTab:r.node.path];
+    else [gApp.editor openPath:r.node.path];
     [gApp.editor selectQuery:Trim(self.searchField.stringValue)];
 }
 
@@ -3675,8 +4093,9 @@ static QSwitcher *gSwitcher;
 - (void)openRow:(NSInteger)row {
     if (row < 0 || row >= (NSInteger)self.matches.count) return;
     QNode *n = self.matches[(NSUInteger)row];
+    BOOL newTab = (NSApp.currentEvent.modifierFlags & NSEventModifierFlagCommand) != 0;
     [self dismiss];
-    [gApp.editor openPath:n.path];
+    if (newTab) [gApp.editor openInNewTab:n.path]; else [gApp.editor openPath:n.path];
 }
 
 - (void)clicked:(id)s { [self openRow:self.table.clickedRow]; }
@@ -3725,22 +4144,8 @@ static QSwitcher *gSwitcher;
 
 static QSettings *gSettings;
 
-static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
-    NSDateFormatter *f = [NSDateFormatter new];
-    f.locale = [NSLocale localeWithLocaleIdentifier:@"en_AU"];
-    NSCalendar *iso = [NSCalendar calendarWithIdentifier:NSCalendarIdentifierISO8601];
-    iso.locale = f.locale;
-    f.calendar = iso;
-    f.dateFormat = fmt.length ? fmt : @"yyyy-MM-dd";
-    NSString *rel = [f stringFromDate:date];
-    NSMutableArray *parts = [NSMutableArray array];
-    for (NSString *p in [rel componentsSeparatedByString:@"/"]) if (Trim(p).length) [parts addObject:SafeName(p)];
-    if (!parts.count) [parts addObject:@"Untitled"];
-    return [[parts componentsJoinedByString:@"/"] stringByAppendingPathExtension:@"md"];
-}
-
 @interface QSettings ()
-@property (strong) NSTextField *vaultLabel, *dailyField, *weeklyField, *dailyPreview, *weeklyPreview;
+@property (strong) NSTextField *vaultLabel, *dateField, *datePreview;
 @property (strong) NSPopUpButton *sizePop, *widthPop, *placePop;
 @end
 
@@ -3793,7 +4198,7 @@ static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
 
     row(@"Page width", y);
     self.widthPop = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(cx, y - 1, 160, 26) pullsDown:NO];
-    [self.widthPop addItemsWithTitles:@[@"Narrow", @"Normal", @"Wide", @"Extra wide"]];
+    [self.widthPop addItemsWithTitles:@[@"Narrow", @"Normal", @"Wide", @"Extra wide", @"Full width"]];
     self.widthPop.target = self; self.widthPop.action = @selector(changed:);
     [v addSubview:self.widthPop];
     y += 40;
@@ -3805,32 +4210,21 @@ static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
     [v addSubview:self.placePop];
     y += 52;
 
-    row(@"Daily note", y);
-    self.dailyField = [[NSTextField alloc] initWithFrame:NSMakeRect(cx, y, cw, 24)];
-    self.dailyField.font = Mono(12);
-    self.dailyField.delegate = self;
-    [v addSubview:self.dailyField];
-    self.dailyPreview = Label(@"", UIFont(11.5, NSFontWeightRegular), qMuted);
-    self.dailyPreview.frame = NSMakeRect(cx, y + 28, cw, 16);
-    [v addSubview:self.dailyPreview];
-    y += 62;
+    row(@"Date (⌘D)", y);
+    self.dateField = [[NSTextField alloc] initWithFrame:NSMakeRect(cx, y, 200, 24)];
+    self.dateField.font = Mono(12);
+    self.dateField.delegate = self;
+    [v addSubview:self.dateField];
+    self.datePreview = Label(@"", UIFont(11.5, NSFontWeightRegular), qMuted);
+    self.datePreview.frame = NSMakeRect(cx, y + 28, cw, 16);
+    [v addSubview:self.datePreview];
+    y += 56;
 
-    row(@"Weekly note", y);
-    self.weeklyField = [[NSTextField alloc] initWithFrame:NSMakeRect(cx, y, cw, 24)];
-    self.weeklyField.font = Mono(12);
-    self.weeklyField.delegate = self;
-    [v addSubview:self.weeklyField];
-    self.weeklyPreview = Label(@"", UIFont(11.5, NSFontWeightRegular), qMuted);
-    self.weeklyPreview.frame = NSMakeRect(cx, y + 28, cw, 16);
-    [v addSubview:self.weeklyPreview];
-    y += 60;
-
-    NSTextField *help = Label(@"Date letters: yyyy year, MM month number, MMMM month name, dd day, EEEE weekday, YYYY and ww for the week. "
-                              @"A slash starts a folder. Words in 'single quotes' stay as written. ⌘D opens today's note, ⇧⌘D this week's.",
-                              UIFont(11.5, NSFontWeightRegular), qFaint);
+    NSTextField *help = Label(@"⌘D types today's date where the cursor is. Letters: yyyy year, MM month, MMMM month name, dd day, EEEE weekday. "
+                              @"Anything in 'single quotes' stays as written.", UIFont(11.5, NSFontWeightRegular), qFaint);
     help.lineBreakMode = NSLineBreakByWordWrapping;
-    help.maximumNumberOfLines = 4;
-    help.frame = NSMakeRect(cx, y, cw, 64);
+    help.maximumNumberOfLines = 3;
+    help.frame = NSMakeRect(cx, y, cw, 48);
     [v addSubview:help];
     return self;
 }
@@ -3840,29 +4234,26 @@ static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
     NSInteger size = (NSInteger)[Defaults() doubleForKey:kFontSize];
     [self.sizePop selectItemAtIndex:MAX(0, MIN(8, size - 14))];
     double w = [Defaults() doubleForKey:kPageWidth];
-    [self.widthPop selectItemAtIndex:w <= 610 ? 0 : w <= 690 ? 1 : w <= 790 ? 2 : 3];
+    [self.widthPop selectItemAtIndex:w <= 0 ? 4 : w <= 610 ? 0 : w <= 690 ? 1 : w <= 790 ? 2 : 3];
     [self.placePop selectItemAtIndex:[Defaults() integerForKey:kNewNoteLoc] ? 1 : 0];
-    self.dailyField.stringValue = [Defaults() stringForKey:kDailyFmt] ?: @"";
-    self.weeklyField.stringValue = [Defaults() stringForKey:kWeeklyFmt] ?: @"";
+    self.dateField.stringValue = [Defaults() stringForKey:kDateFmt] ?: @"";
     [self previews];
 }
 
 - (void)previews {
-    self.dailyPreview.stringValue = [@"Today: " stringByAppendingString:PeriodicPath(self.dailyField.stringValue, [NSDate date])];
-    self.weeklyPreview.stringValue = [@"This week: " stringByAppendingString:PeriodicPath(self.weeklyField.stringValue, [NSDate date])];
+    self.datePreview.stringValue = [@"Today: " stringByAppendingString:TodayString(self.dateField.stringValue)];
 }
 
 - (void)changed:(id)sender {
     [Defaults() setDouble:14 + self.sizePop.indexOfSelectedItem forKey:kFontSize];
-    NSArray *widths = @[@600, @680, @780, @920];
+    NSArray *widths = @[@600, @680, @780, @920, @0];
     [Defaults() setObject:widths[(NSUInteger)MAX(0, self.widthPop.indexOfSelectedItem)] forKey:kPageWidth];
     [Defaults() setInteger:self.placePop.indexOfSelectedItem forKey:kNewNoteLoc];
     [gApp.editor applySettings];
 }
 
 - (void)controlTextDidChange:(NSNotification *)n {
-    [Defaults() setObject:self.dailyField.stringValue forKey:kDailyFmt];
-    [Defaults() setObject:self.weeklyField.stringValue forKey:kWeeklyFmt];
+    [Defaults() setObject:self.dateField.stringValue forKey:kDateFmt];
     [self previews];
 }
 
@@ -3922,6 +4313,7 @@ static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
 - (void)applicationWillTerminate:(NSNotification *)n {
     [self.editor saveNow];
     [self.editor rememberCaret];
+    [self.editor saveTabs];
 }
 
 - (void)applicationDidResignActive:(NSNotification *)n { [self.editor saveNow]; }
@@ -3954,6 +4346,8 @@ static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
         [Defaults() setObject:self.vault.root forKey:kVaultPath];
         if (![[Defaults() stringForKey:@"lastVault"] isEqualToString:self.vault.root]) {
             [Defaults() removeObjectForKey:kLastNote];
+            [Defaults() removeObjectForKey:kTabs];
+            [Defaults() removeObjectForKey:kActiveTab];
             [Defaults() setObject:@[] forKey:kExpanded];
         }
         [Defaults() setObject:self.vault.root forKey:@"lastVault"];
@@ -3964,9 +4358,7 @@ static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
     }];
     self.window.title = self.vault.name;
     [self.sidebar reload];
-    NSString *last = [Defaults() stringForKey:kLastNote];
-    NSString *p = last.length ? [self.vault.root stringByAppendingPathComponent:last] : nil;
-    if (p && [NSFileManager.defaultManager fileExistsAtPath:p]) [self.editor openPath:p history:NO];
+    [self.editor restoreTabs];
 }
 
 - (void)fsEvent:(NSArray<NSString *> *)paths flags:(NSArray<NSNumber *> *)flags {
@@ -3995,7 +4387,7 @@ static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
     if (!self.vault) return;
     [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(rescanNow) object:nil];
     [self.vault rescan];
-    if (self.editor.path && ![NSFileManager.defaultManager fileExistsAtPath:self.editor.path]) [self.editor closeNote];
+    [self.editor dropMissingTabs];
     [self.sidebar reload];
     if (self.editor.path) [self.sidebar revealPath:self.editor.path];
 }
@@ -4013,18 +4405,6 @@ static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
     if (![@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]) { NSBeep(); return nil; }
     [self rescanNow];
     return p;
-}
-
-- (void)openPeriodic:(NSString *)key {
-    if (!self.vault) { [self chooseVault]; return; }
-    NSString *rel = PeriodicPath([Defaults() stringForKey:key], [NSDate date]);
-    NSString *p = [self.vault.root stringByAppendingPathComponent:rel];
-    if (![NSFileManager.defaultManager fileExistsAtPath:p]) {
-        [NSFileManager.defaultManager createDirectoryAtPath:p.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
-        [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        [self rescanNow];
-    }
-    [self.editor openPath:p];
 }
 
 #pragma mark Sidebar
@@ -4057,11 +4437,13 @@ static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
 - (void)newNote:(id)s { [self.sidebar newNote]; }
 - (void)newFolder:(id)s { [self.sidebar newFolder]; }
 - (void)quickOpen:(id)s { [QSwitcher show]; }
-- (void)todayNote:(id)s { [self openPeriodic:kDailyFmt]; }
-- (void)weekNote:(id)s { [self openPeriodic:kWeeklyFmt]; }
 - (void)showSearch:(id)s { [self.sidebar showSearch:nil]; }
 - (void)showFilesTab:(id)s { if (self.sidebarHidden) [self toggleSidebar:nil]; [self.sidebar showFiles]; }
 - (void)goBack:(id)s { [self.editor goBack]; }
+- (void)newTab:(id)s { [self.editor newTab]; }
+- (void)closeTab:(id)s { [self.editor closeTabAt:self.editor.active]; }
+- (void)nextTab:(id)s { [self.editor cycleTab:1]; }
+- (void)previousTab:(id)s { [self.editor cycleTab:-1]; }
 - (void)goForward:(id)s { [self.editor goForward]; }
 - (void)openVaultAction:(id)s { [self chooseVault]; }
 - (void)showSettings:(id)s { [QSettings show]; }
@@ -4121,17 +4503,16 @@ static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
     NSMenu *file = [[NSMenu alloc] initWithTitle:@"File"];
     [self item:@"New Note" action:@selector(newNote:) key:@"n" mods:C in:file];
     [self item:@"New Folder" action:@selector(newFolder:) key:@"n" mods:C | S in:file];
+    [self item:@"New Tab" action:@selector(newTab:) key:@"t" mods:C in:file];
     [self item:@"Quick Switcher…" action:@selector(quickOpen:) key:@"o" mods:C in:file];
-    [file addItem:NSMenuItem.separatorItem];
-    [self item:@"Today's Note" action:@selector(todayNote:) key:@"d" mods:C in:file];
-    [self item:@"This Week's Note" action:@selector(weekNote:) key:@"d" mods:C | S in:file];
     [file addItem:NSMenuItem.separatorItem];
     [self item:@"Rename Note" action:@selector(renameCurrent:) key:@"r" mods:C in:file];
     [self item:@"Show in Finder" action:@selector(revealCurrent:) key:@"r" mods:C | S in:file];
     [self item:@"Move to Trash" action:@selector(trashCurrent:) key:@"\b" mods:C | O in:file];
     [file addItem:NSMenuItem.separatorItem];
     [self item:@"Open Vault…" action:@selector(openVaultAction:) key:@"o" mods:C | S in:file];
-    [self item:@"Close Window" action:@selector(performClose:) key:@"w" mods:C in:file];
+    [self item:@"Close Tab" action:@selector(closeTab:) key:@"w" mods:C in:file];
+    [self item:@"Close Window" action:@selector(performClose:) key:@"w" mods:C | S in:file];
     [bar addItemWithTitle:@"" action:nil keyEquivalent:@""].submenu = file;
 
     NSMenu *edit = [[NSMenu alloc] initWithTitle:@"Edit"];
@@ -4160,6 +4541,7 @@ static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
     [self item:@"Highlight" action:@selector(mdHighlight:) key:@"h" mods:C | S in:fmt];
     [self item:@"Inline Code" action:@selector(mdCode:) key:@"c" mods:C | O in:fmt];
     [self item:@"Link to Note" action:@selector(mdLink:) key:@"k" mods:C in:fmt];
+    [self item:@"Insert Today's Date" action:@selector(insertDate:) key:@"d" mods:C in:fmt];
     [self item:@"Toggle Checkbox" action:@selector(mdTask:) key:@"l" mods:C in:fmt];
     [fmt addItem:NSMenuItem.separatorItem];
     [self item:@"Heading 1" action:@selector(mdHeading:) key:@"1" mods:C in:fmt].tag = 1;
@@ -4177,6 +4559,13 @@ static NSString *PeriodicPath(NSString *fmt, NSDate *date) {
     [self item:@"Unfold Heading" action:@selector(unfoldHeading:) key:@"]" mods:C | O in:view];
     [self item:@"Fold All Headings" action:@selector(foldAllHeadings:) key:@"[" mods:C | O | S in:view];
     [self item:@"Unfold All Headings" action:@selector(unfoldAllHeadings:) key:@"]" mods:C | O | S in:view];
+    [view addItem:NSMenuItem.separatorItem];
+    [self item:@"Next Tab" action:@selector(nextTab:) key:@"\t" mods:K in:view];
+    [self item:@"Previous Tab" action:@selector(previousTab:) key:@"\t" mods:K | S in:view];
+    NSMenuItem *nt2 = [self item:@"Next Tab" action:@selector(nextTab:) key:@"]" mods:C | S in:view];
+    nt2.hidden = YES; nt2.allowsKeyEquivalentWhenHidden = YES;
+    NSMenuItem *pt2 = [self item:@"Previous Tab" action:@selector(previousTab:) key:@"[" mods:C | S in:view];
+    pt2.hidden = YES; pt2.allowsKeyEquivalentWhenHidden = YES;
     [view addItem:NSMenuItem.separatorItem];
     [self item:@"Back" action:@selector(goBack:) key:@"[" mods:C in:view];
     [self item:@"Forward" action:@selector(goForward:) key:@"]" mods:C in:view];
@@ -4203,9 +4592,8 @@ int main(int argc, const char *argv[]) {
         gParaCache = [NSMutableDictionary dictionary];
         gTextCache = [NSMutableDictionary dictionary];
         [Defaults() registerDefaults:@{
-            kFontSize: @17, kPageWidth: @680, kSortMode: @0, kNewNoteLoc: @0, kSidebarW: @260,
-            kDailyFmt: @"'Daily'/yyyy/MMMM/yyyy-MM-dd",
-            kWeeklyFmt: @"'Weekly'/YYYY/YYYY-'W'ww",
+            kFontSize: @17, kPageWidth: @0, kSortMode: @0, kNewNoteLoc: @0, kSidebarW: @260,
+            kDateFmt: @"yyyy-MM-dd",
         }];
         gBase = [Defaults() doubleForKey:kFontSize];
         InitPalette();
