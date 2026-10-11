@@ -2373,8 +2373,11 @@ static NSDictionary *FoldAttrs(void) {
             NSUInteger f = MIN(self.styleFocus, len);
             NSUInteger from = f > 30000 ? f - 30000 : 0, to = MIN(len, f + 30000);
             StyleRange(ts, NSMakeRange(from, to - from), self.blocks, self.front);
+            NSUInteger top = MIN(len, 25000);
+            StyleRange(ts, NSMakeRange(0, top), self.blocks, self.front);
             NSUInteger gen = ++self.styleGen;
-            self.chunkPos = 0;
+            NSRange topDone = [s lineRangeForRange:NSMakeRange(0, top)];
+            self.chunkPos = NSMaxRange(topDone);
             NSRange done = [s lineRangeForRange:NSMakeRange(from, to - from)];
             dispatch_async(dispatch_get_main_queue(), ^{ [self styleSliceGen:gen skip:done]; });
         } else {
@@ -2442,6 +2445,18 @@ static NSDictionary *FoldAttrs(void) {
         }
         [ts endEditing];
         self.styling = NO;
+        // A folded heading and its hidden block lay out as one unit; refresh the whole unit, or the
+        // heading keeps a stale line width for a moment and wraps ("202 / 0").
+        NSLayoutManager *lm = self.textView.layoutManager;
+        for (NSValue *v in self.hidden) {
+            NSRange h = v.rangeValue;
+            NSUInteger lineStart = [s lineRangeForRange:NSMakeRange(MIN(h.location, len), 0)].location;
+            NSRange unit = NSMakeRange(lineStart, MIN(len, NSMaxRange(h) + 1) - lineStart);
+            if (!NSIntersectionRange(unit, r).length) continue;
+            [lm invalidateGlyphsForCharacterRange:unit changeInLength:0 actualCharacterRange:NULL];
+            [lm invalidateLayoutForCharacterRange:unit actualCharacterRange:NULL];
+        }
+        self.textView.needsDisplay = YES;
     }
     dispatch_async(dispatch_get_main_queue(), ^{ [self styleSliceGen:gen skip:done]; });
 }
@@ -2470,9 +2485,13 @@ static NSDictionary *FoldAttrs(void) {
     NSUInteger len = self.textView.string.length;
     NSMutableArray *rs = [ranges mutableCopy];
     if (all) [rs addObject:[NSValue valueWithRange:NSMakeRange(0, len)]];
+    NSString *str = self.textView.string;
     for (NSValue *v in rs) {
         NSRange r = v.rangeValue;
         if (r.location > len) continue;
+        // include the heading line that owns this block
+        NSUInteger ls = [str lineRangeForRange:NSMakeRange(MIN(r.location, len), 0)].location;
+        if (ls < r.location) r = NSMakeRange(ls, NSMaxRange(r) - ls);
         NSUInteger from = r.location > 0 ? r.location - 1 : 0;
         NSUInteger to = MIN(len, NSMaxRange(r) + 1);
         if (to <= from) continue;
