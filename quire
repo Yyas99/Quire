@@ -1,0 +1,63 @@
+#!/bin/bash
+# Quire: builds (when the source changed) and opens Quire.app.
+# Needs only Apple's free Command Line Tools; no Xcode.
+#   ./quire          build if Quire.m changed, then open
+#   ./quire build    force a rebuild, then open
+#   ./quire stop     quit Quire
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"
+APP="$DIR/Quire.app"
+BIN="$APP/Contents/MacOS/Quire"
+SRC="$DIR/Quire.m"
+LOG="$DIR/build.log"
+
+if [ "$1" = "stop" ]; then pkill -x Quire 2>/dev/null || true; echo "Quire stopped"; exit 0; fi
+
+if ! xcode-select -p >/dev/null 2>&1; then
+  echo "Apple's Command Line Tools aren't installed. A window will offer to install them;"
+  echo "when that finishes, run this again."
+  xcode-select --install || true
+  exit 1
+fi
+
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cat > "$APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleName</key><string>Quire</string>
+  <key>CFBundleDisplayName</key><string>Quire</string>
+  <key>CFBundleIdentifier</key><string>com.y.quire</string>
+  <key>CFBundleExecutable</key><string>Quire</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>0.1</string>
+  <key>CFBundleIconFile</key><string>Quire</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSHumanReadableCopyright</key><string>MIT licence</string>
+</dict></plist>
+PLIST
+[ -f "$DIR/Quire.icns" ] && cp -f "$DIR/Quire.icns" "$APP/Contents/Resources/Quire.icns"
+touch "$APP"
+
+if [ "$1" = "build" ] || [ ! -x "$BIN" ] || [ "$SRC" -nt "$BIN" ]; then
+  echo "Compiling Quire…" | tee "$LOG"
+  FLAGS=(-fobjc-arc -O2 -Wall -Wno-deprecated-declarations -mmacosx-version-min=11.0
+         -framework Cocoa -framework CoreServices -framework CoreText)
+  # One binary for both Intel and Apple silicon Macs; fall back to this Mac's own chip if that fails.
+  if ! clang -arch x86_64 -arch arm64 "${FLAGS[@]}" "$SRC" -o "$BIN" >>"$LOG" 2>&1; then
+    echo "(universal build unavailable, building for this Mac only)" >>"$LOG"
+    if ! clang "${FLAGS[@]}" "$SRC" -o "$BIN" >>"$LOG" 2>&1; then
+      echo "BUILD FAILED" | tee -a "$LOG"; cat "$LOG"; exit 1
+    fi
+  fi
+  codesign -s - -f --identifier com.y.quire "$APP" >/dev/null 2>&1 || true
+  echo "Built $APP" | tee -a "$LOG"
+fi
+
+pkill -x Quire 2>/dev/null || true
+for i in $(seq 1 30); do pgrep -x Quire >/dev/null || break; sleep 0.1; done
+open "$APP"
+echo "Quire is running."
