@@ -26,6 +26,7 @@ static NSString *const kActiveTab  = @"activeTab";
 static NSString *const kLook       = @"look";           // 0 Quire, 1 Obsidian
 static NSString *const kLineNumbers = @"lineNumbers";
 static NSString *const kOutlineShown = @"outlineShown";
+static NSString *const kRecent       = @"recentNotes";
 
 static NSInteger gLook = 0;
 static BOOL gLineNumbers = NO;
@@ -319,6 +320,12 @@ typedef NS_ENUM(NSInteger, QSort) { QSortNameAZ, QSortNameZA, QSortModNew, QSort
 - (void)applyTheme;
 - (void)layout;
 - (BOOL)isHiddenChar:(NSUInteger)ci;
+@end
+
+@interface QHome : NSView <NSTextFieldDelegate>
+@property (strong) NSTextField *field;
+- (void)refresh;
+- (void)applyTheme;
 @end
 
 @interface QSidebar : NSView <NSOutlineViewDataSource, NSOutlineViewDelegate, NSTableViewDataSource, NSTableViewDelegate,
@@ -1999,15 +2006,10 @@ static NSString *TodayString(NSString *fmt) {
     self.status.alignment = NSTextAlignmentRight;
     [v addSubview:self.status];
 
-    // Shown when nothing is open.
-    NSView *empty = [[NSView alloc] initWithFrame:v.bounds];
-    NSTextField *e1 = Label(@"Nothing open", Serif(26, YES, NO), qHead);
-    NSTextField *e2 = Label(@"Pick a note on the left, press ⌘O to jump to one, or ⌘N to start a new one.", UIFont(13, NSFontWeightRegular), qMuted);
-    e1.alignment = NSTextAlignmentCenter; e2.alignment = NSTextAlignmentCenter;
-    e1.tag = 1; e2.tag = 2;
-    [empty addSubview:e1]; [empty addSubview:e2];
-    self.emptyView = empty;
-    [v addSubview:empty];
+    // The new tab page: today, a search box and recent notes.
+    QHome *home = [[QHome alloc] initWithFrame:v.bounds];
+    self.emptyView = home;
+    [v addSubview:home];
 
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(layout) name:NSViewFrameDidChangeNotification object:v];
     v.postsFrameChangedNotifications = YES;
@@ -2042,9 +2044,6 @@ static NSString *TodayString(NSString *fmt) {
     self.scroll.frame = body;
     self.canvas.frame = body;
     self.emptyView.frame = body;
-    NSTextField *e1 = [self.emptyView viewWithTag:1], *e2 = [self.emptyView viewWithTag:2];
-    e1.frame = NSMakeRect(0, NSHeight(body) / 2 + 6, NSWidth(body), 34);
-    e2.frame = NSMakeRect(20, NSHeight(body) / 2 - 22, NSWidth(body) - 40, 20);
     self.status.frame = NSMakeRect(NSWidth(body) - 320, 10, 300, 16);
     self.textView.minSize = NSMakeSize(0, NSHeight(body));
     [self.textView updateGeometry];
@@ -2053,6 +2052,14 @@ static NSString *TodayString(NSString *fmt) {
 
 - (void)showEmpty:(BOOL)empty {
     self.emptyView.hidden = !empty;
+    if (empty) {
+        QHome *home = (QHome *)self.emptyView;
+        [home refresh];
+        // Typing on a new tab goes straight into its search box (later, so it also works at launch).
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!home.hidden && home.window && !home.field.currentEditor) [home.window makeFirstResponder:home.field];
+        });
+    }
     self.scroll.hidden = empty || [self isCanvasPath:self.path];
     self.canvas.hidden = empty || ![self isCanvasPath:self.path];
     self.status.hidden = empty;
@@ -2114,6 +2121,7 @@ static NSString *TodayString(NSString *fmt) {
     if (h && self.tab.path) { [self.tab.back addObject:self.tab.path]; [self.tab.forward removeAllObjects]; }
     self.path = path;
     self.tab.path = path;
+    [self noteRecent:path];
 
     if ([self isCanvasPath:path]) {
         self.textView.titleField.stringValue = [path.lastPathComponent stringByDeletingPathExtension];
@@ -2251,7 +2259,34 @@ static NSString *MovedPath(NSString *p, NSString *from, NSString *to) {
     return p;
 }
 
+// Most recently opened notes first, for the new tab page.
+- (void)noteRecent:(NSString *)path {
+    NSString *rel = [gApp.vault rel:path];
+    if (!rel.length) return;
+    NSMutableArray *a = [([Defaults() arrayForKey:kRecent] ?: @[]) mutableCopy];
+    NSIndexSet *dup = [a indexesOfObjectsPassingTest:^BOOL(id d, NSUInteger i, BOOL *stop) {
+        return [d isKindOfClass:NSDictionary.class] && [d[@"p"] isEqual:rel];
+    }];
+    [a removeObjectsAtIndexes:dup];
+    [a insertObject:@{@"p": rel, @"t": @(NSDate.date.timeIntervalSince1970)} atIndex:0];
+    while (a.count > 24) [a removeLastObject];
+    [Defaults() setObject:a forKey:kRecent];
+}
+
 - (void)pathMoved:(NSString *)from to:(NSString *)to {
+    NSArray *recent = [Defaults() arrayForKey:kRecent];
+    if (recent.count && gApp.vault.root) {
+        NSMutableArray *moved = [NSMutableArray array];
+        for (NSDictionary *d in recent) {
+            if (![d isKindOfClass:NSDictionary.class] || ![d[@"p"] isKindOfClass:NSString.class]) continue;
+            NSString *abs = [gApp.vault.root stringByAppendingPathComponent:d[@"p"]];
+            NSString *now = MovedPath(abs, from, to);
+            NSMutableDictionary *m = [d mutableCopy];
+            m[@"p"] = [gApp.vault rel:now] ?: d[@"p"];
+            [moved addObject:m];
+        }
+        [Defaults() setObject:moved forKey:kRecent];
+    }
     for (QTab *t in self.tabs) {
         t.path = MovedPath(t.path, from, to);
         for (NSMutableArray *list in @[t.back, t.forward])
@@ -3043,6 +3078,7 @@ static NSDictionary *FoldAttrs(void) {
     [self.topBar refresh];
     self.canvas.needsDisplay = YES;
     [self.outlinePanel applyTheme];
+    [(QHome *)self.emptyView applyTheme];
     if (self.path && ![self isCanvasPath:self.path]) [self computeStructure];
 }
 
@@ -4620,6 +4656,288 @@ static QSwitcher *gSwitcher;
         ((QRowView *)rv).current = (row == self.table.selectedRow);
         rv.needsDisplay = YES;
     }];
+}
+
+@end
+
+#pragma mark - New tab page
+
+// "5 min", "3 h", "Yesterday", "Mon", "12 Oct": how long ago, in as few characters as reads naturally.
+static NSString *Ago(NSDate *d) {
+    if (!d) return @"";
+    NSTimeInterval s = -d.timeIntervalSinceNow;
+    if (s < 60) return @"just now";
+    if (s < 3600) return [NSString stringWithFormat:@"%d min", (int)(s / 60)];
+    NSCalendar *cal = NSCalendar.currentCalendar;
+    if ([cal isDateInToday:d]) return [NSString stringWithFormat:@"%d h", (int)(s / 3600)];
+    if ([cal isDateInYesterday:d]) return @"Yesterday";
+    NSDateFormatter *f = [NSDateFormatter new];
+    f.dateFormat = s < 6 * 86400 ? @"EEE" : ([cal component:NSCalendarUnitYear fromDate:d] == [cal component:NSCalendarUnitYear fromDate:NSDate.date] ? @"d MMM" : @"d MMM yyyy");
+    return [f stringFromDate:d];
+}
+
+static NSImage *Tinted(NSImage *im, NSColor *c) {
+    if (!im) return nil;
+    NSImage *out = [NSImage imageWithSize:im.size flipped:NO drawingHandler:^BOOL(NSRect r) {
+        [im drawInRect:r];
+        [c set];
+        NSRectFillUsingOperation(r, NSCompositingOperationSourceAtop);
+        return YES;
+    }];
+    return out;
+}
+
+@interface QHome ()
+@property (strong) NSArray<NSDictionary *> *items;   // {node, date} or {create: name}
+@property NSInteger sel, hover;
+@property (copy) NSString *section;
+@property NSRect fieldBox;
+@property CGFloat rowsTop, rowH, colX, colW;
+@end
+
+@implementation QHome
+
+- (BOOL)isFlipped { return YES; }
+
+- (instancetype)initWithFrame:(NSRect)r {
+    if (!(self = [super initWithFrame:r])) return nil;
+    NSTextField *f = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    f.bezeled = NO; f.bordered = NO; f.drawsBackground = NO; f.focusRingType = NSFocusRingTypeNone;
+    f.font = UIFont(15, NSFontWeightRegular);
+    f.delegate = self;
+    f.cell.usesSingleLineMode = YES;
+    f.cell.scrollable = YES;
+    self.field = f;
+    [self addSubview:f];
+    Clip(self);
+    self.hover = -1;
+    self.rowH = 40;
+    [self applyTheme];
+    return self;
+}
+
+- (void)applyTheme {
+    self.field.textColor = qHead;
+    self.field.placeholderAttributedString = [[NSAttributedString alloc] initWithString:@"Find a note, or type a new name"
+        attributes:@{NSFontAttributeName: UIFont(15, NSFontWeightRegular), NSForegroundColorAttributeName: qFaint}];
+    self.needsDisplay = YES;
+}
+
+- (void)refresh {
+    self.field.stringValue = @"";
+    [self update];
+}
+
+- (void)update {
+    NSString *q = Trim(self.field.stringValue).lowercaseString;
+    QVault *v = gApp.vault;
+    NSMutableArray *out = [NSMutableArray array];
+    if (!v) { self.items = @[]; self.section = @""; [self layoutRows]; return; }
+    if (!q.length) {
+        NSMutableSet *seen = [NSMutableSet set];
+        for (NSDictionary *d in [Defaults() arrayForKey:kRecent]) {
+            if (![d isKindOfClass:NSDictionary.class] || ![d[@"p"] isKindOfClass:NSString.class]) continue;
+            QNode *n = v.byPath[[v.root stringByAppendingPathComponent:d[@"p"]]];
+            if (!n || [seen containsObject:n.path]) continue;
+            [seen addObject:n.path];
+            [out addObject:@{@"node": n, @"date": [NSDate dateWithTimeIntervalSince1970:[d[@"t"] doubleValue]]}];
+            if (out.count >= 8) break;
+        }
+        if (out.count < 8) {   // top up with the most recently edited notes
+            NSArray *byMod = [v.notes sortedArrayUsingComparator:^NSComparisonResult(QNode *a, QNode *b) {
+                return [b.mtime ?: NSDate.distantPast compare:a.mtime ?: NSDate.distantPast];
+            }];
+            for (QNode *n in byMod) {
+                if (out.count >= 8) break;
+                if ([seen containsObject:n.path]) continue;
+                [seen addObject:n.path];
+                [out addObject:@{@"node": n, @"date": n.mtime ?: NSDate.distantPast}];
+            }
+        }
+        self.section = @"RECENT";
+    } else {
+        NSMutableArray *scored = [NSMutableArray array];
+        for (QNode *n in v.notes) {
+            NSInteger a = Fuzzy(q, n.name.lowercaseString), b = Fuzzy(q, Pretty(n.rel).lowercaseString);
+            NSInteger s = MAX(a >= 0 ? a + 15 : -1, b);
+            if (s >= 0) [scored addObject:@[@(s), n]];
+        }
+        [scored sortUsingComparator:^NSComparisonResult(NSArray *x, NSArray *y) { return [y[0] compare:x[0]]; }];
+        for (NSArray *pair in scored) { QNode *n = pair[1]; [out addObject:@{@"node": n, @"date": n.mtime ?: NSDate.distantPast}]; if (out.count >= 7) break; }
+        [out addObject:@{@"create": Trim(self.field.stringValue)}];
+        self.section = out.count > 1 ? @"MATCHES" : @"";
+    }
+    self.items = out;
+    self.sel = 0;
+    [self layoutRows];
+}
+
+- (void)setFrameSize:(NSSize)s { [super setFrameSize:s]; [self layoutRows]; }
+
+- (void)layoutRows {
+    NSRect b = self.bounds;
+    self.colW = MIN(580, NSWidth(b) - 80);
+    self.colX = round((NSWidth(b) - self.colW) / 2);
+    CGFloat top = round(MAX(40, NSHeight(b) * 0.15));
+    self.fieldBox = NSMakeRect(self.colX, top + 92, self.colW, 44);
+    self.field.frame = NSMakeRect(self.colX + 44, top + 92 + 12, self.colW - 60, 22);
+    self.rowsTop = top + 92 + 44 + 34;
+    // never draw rows into the footer
+    CGFloat room = NSHeight(b) - 56 - self.rowsTop;
+    NSInteger fit = MAX(0, (NSInteger)(room / self.rowH));
+    if ((NSInteger)self.items.count > fit) self.items = [self.items subarrayWithRange:NSMakeRange(0, (NSUInteger)fit)];
+    if (self.sel >= (NSInteger)self.items.count) self.sel = MAX(0, (NSInteger)self.items.count - 1);
+    self.needsDisplay = YES;
+}
+
+- (NSRect)rowRect:(NSInteger)i { return NSMakeRect(self.colX - 10, self.rowsTop + i * self.rowH, self.colW + 20, self.rowH - 2); }
+
+- (void)drawRect:(NSRect)dirty {
+    dirty = NSIntersectionRect(dirty, self.bounds);   // macOS 14 no longer clips views by default
+    [qDesk setFill];
+    NSRectFill(dirty);
+    if (gLook == 0) {   // the same dot grid as the desk around a page
+        NSInteger x0 = (NSInteger)floor(NSMinX(dirty) / 20), x1 = (NSInteger)ceil(NSMaxX(dirty) / 20);
+        NSInteger y0 = (NSInteger)floor(NSMinY(dirty) / 20), y1 = (NSInteger)ceil(NSMaxY(dirty) / 20);
+        NSInteger cap = (x1 - x0 + 1) * (y1 - y0 + 1);
+        if (cap > 0 && cap < 200000) {
+            NSRect *dots = malloc(sizeof(NSRect) * (size_t)cap); NSInteger n = 0;
+            for (NSInteger yi = y0; yi <= y1; yi++) for (NSInteger xi = x0; xi <= x1; xi++)
+                dots[n++] = NSMakeRect(xi * 20 + 10, yi * 20 + 10, 1.2, 1.2);
+            [qDot setFill]; NSRectFillList(dots, n); free(dots);
+        }
+    }
+    NSRect b = self.bounds;
+    CGFloat top = NSMinY(self.fieldBox) - 92;
+    // a quiet surface behind the column so text never sits on dots
+    NSRect panel = NSMakeRect(self.colX - 28, top - 26, self.colW + 56, MIN(NSHeight(b) - 40, self.rowsTop + self.items.count * self.rowH + 24) - (top - 26));
+    RoundRect(panel, 16, gLook == 0 ? HexA(0x121212, 0.92) : qDesk);
+
+    NSDate *now = NSDate.date;
+    NSDateFormatter *f = [NSDateFormatter new];
+    f.dateFormat = @"EEEE";
+    [[f stringFromDate:now] drawAtPoint:NSMakePoint(self.colX, top) withAttributes:@{NSFontAttributeName: Serif(36, YES, NO), NSForegroundColorAttributeName: qHead}];
+    f.dateFormat = @"d MMMM yyyy";
+    NSString *sub = [NSString stringWithFormat:@"%@  ·  %@ notes", [f stringFromDate:now], @(gApp.vault.notes.count)];
+    [sub drawAtPoint:NSMakePoint(self.colX + 1, top + 52) withAttributes:@{NSFontAttributeName: UIFont(13, NSFontWeightRegular), NSForegroundColorAttributeName: qMuted}];
+
+    // search pill
+    BOOL focused = self.window.firstResponder == self.field.currentEditor;
+    RoundRect(self.fieldBox, 12, focused ? qSideSel : qSideHover);
+    if (focused) {
+        NSBezierPath *ring = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.fieldBox, 0.5, 0.5) xRadius:12 yRadius:12];
+        [qRule setStroke]; ring.lineWidth = 1; [ring stroke];
+    }
+    NSImage *mag = Tinted(Symbol(@"magnifyingglass", 14, NSFontWeightRegular), qMuted);
+    [mag drawInRect:NSMakeRect(NSMinX(self.fieldBox) + 16, NSMidY(self.fieldBox) - mag.size.height / 2, mag.size.width, mag.size.height)
+           fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1 respectFlipped:YES hints:nil];
+
+    if (self.section.length)
+        [self.section drawAtPoint:NSMakePoint(self.colX, self.rowsTop - 22) withAttributes:@{NSFontAttributeName: UIFont(10.5, NSFontWeightSemibold),
+            NSForegroundColorAttributeName: qFaint, NSKernAttributeName: @1.2}];
+    else if (!gApp.vault)
+        [@"Choose a vault in Settings to begin." drawAtPoint:NSMakePoint(self.colX, self.rowsTop - 22) withAttributes:@{NSFontAttributeName: UIFont(13, NSFontWeightRegular), NSForegroundColorAttributeName: qMuted}];
+
+    NSMutableParagraphStyle *trunc = [NSMutableParagraphStyle new];
+    trunc.lineBreakMode = NSLineBreakByTruncatingTail;
+    for (NSInteger i = 0; i < (NSInteger)self.items.count; i++) {
+        NSDictionary *it = self.items[(NSUInteger)i];
+        NSRect r = [self rowRect:i];
+        if (i == self.sel) RoundRect(r, 9, qSideSel);
+        else if (i == self.hover) RoundRect(r, 9, qSideHover);
+        CGFloat x = NSMinX(r) + 14, mid = NSMidY(r);
+        if (it[@"create"]) {
+            NSImage *plus = Tinted(Symbol(@"plus", 13, NSFontWeightMedium), qMuted);
+            [plus drawInRect:NSMakeRect(x + 1, mid - plus.size.height / 2, plus.size.width, plus.size.height) fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1 respectFlipped:YES hints:nil];
+            NSMutableAttributedString *t = [[NSMutableAttributedString alloc] initWithString:@"New note  " attributes:@{NSFontAttributeName: UIFont(14, NSFontWeightRegular), NSForegroundColorAttributeName: qMuted}];
+            [t appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"“%@”", it[@"create"]] attributes:@{NSFontAttributeName: UIFont(14, NSFontWeightMedium), NSForegroundColorAttributeName: qHead, NSParagraphStyleAttributeName: trunc}]];
+            [t drawInRect:NSMakeRect(x + 30, mid - 9, NSWidth(r) - 60, 20)];
+            [@"⇧↩" drawAtPoint:NSMakePoint(NSMaxX(r) - 34, mid - 8) withAttributes:@{NSFontAttributeName: UIFont(12, NSFontWeightRegular), NSForegroundColorAttributeName: qFaint}];
+            continue;
+        }
+        QNode *n = it[@"node"];
+        BOOL canvas = [n.ext.lowercaseString isEqualToString:@"canvas"];
+        NSImage *ic = Tinted(Symbol(canvas ? @"square.grid.2x2" : @"doc.text", 13, NSFontWeightRegular), i == self.sel ? qBody2 : qMuted);
+        [ic drawInRect:NSMakeRect(x + 1, mid - ic.size.height / 2, ic.size.width, ic.size.height) fromRect:NSZeroRect operation:NSCompositingOperationSourceOver fraction:1 respectFlipped:YES hints:nil];
+        NSString *ago = Ago(it[@"date"]);
+        NSDictionary *agoA = @{NSFontAttributeName: UIFont(12, NSFontWeightRegular), NSForegroundColorAttributeName: qFaint};
+        CGFloat agoW = [ago sizeWithAttributes:agoA].width;
+        [ago drawAtPoint:NSMakePoint(NSMaxX(r) - 14 - agoW, mid - 8) withAttributes:agoA];
+        NSString *name = canvas ? n.name.stringByDeletingPathExtension : [n.name stringByDeletingPathExtension];
+        NSString *folder = n.rel.stringByDeletingLastPathComponent;
+        NSMutableAttributedString *t = [[NSMutableAttributedString alloc] initWithString:name attributes:@{NSFontAttributeName: UIFont(14, NSFontWeightRegular),
+            NSForegroundColorAttributeName: i == self.sel ? qHead : qText, NSParagraphStyleAttributeName: trunc}];
+        if (folder.length) [t appendAttributedString:[[NSAttributedString alloc] initWithString:[@"    " stringByAppendingString:folder]
+            attributes:@{NSFontAttributeName: UIFont(12, NSFontWeightRegular), NSForegroundColorAttributeName: qFaint, NSParagraphStyleAttributeName: trunc}]];
+        [t drawInRect:NSMakeRect(x + 30, mid - 9, NSWidth(r) - 44 - 30 - agoW - 12, 20)];
+    }
+
+    NSString *hint = @"⌘N  new note        ⌘O  quick switcher        ⇧⌘F  search vault        ⌘T  new tab";
+    NSDictionary *ha = @{NSFontAttributeName: UIFont(11.5, NSFontWeightRegular), NSForegroundColorAttributeName: qFaint};
+    CGFloat hw = [hint sizeWithAttributes:ha].width;
+    if (hw < NSWidth(b) - 40) [hint drawAtPoint:NSMakePoint(round((NSWidth(b) - hw) / 2), NSHeight(b) - 34) withAttributes:ha];
+}
+
+- (NSInteger)rowAt:(NSPoint)p {
+    for (NSInteger i = 0; i < (NSInteger)self.items.count; i++) if (NSPointInRect(p, [self rowRect:i])) return i;
+    return -1;
+}
+
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea *t in self.trackingAreas.copy) [self removeTrackingArea:t];
+    [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect owner:self userInfo:nil]];
+}
+- (void)mouseMoved:(NSEvent *)e {
+    NSInteger h = [self rowAt:[self convertPoint:e.locationInWindow fromView:nil]];
+    if (h != self.hover) { self.hover = h; self.needsDisplay = YES; }
+    if (h >= 0) [NSCursor.pointingHandCursor set]; else [NSCursor.arrowCursor set];
+}
+- (void)mouseExited:(NSEvent *)e { self.hover = -1; self.needsDisplay = YES; [NSCursor.arrowCursor set]; }
+- (void)mouseDown:(NSEvent *)e {
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    NSInteger i = [self rowAt:p];
+    if (i >= 0) [self openItem:i newTab:(e.modifierFlags & NSEventModifierFlagCommand) != 0];
+    else [self.window makeFirstResponder:self.field];
+}
+
+- (void)openItem:(NSInteger)i newTab:(BOOL)nt {
+    if (i < 0 || i >= (NSInteger)self.items.count) return;
+    NSDictionary *it = self.items[(NSUInteger)i];
+    if (it[@"create"]) { [self createNote:it[@"create"]]; return; }
+    QNode *n = it[@"node"];
+    if (nt) [gApp.editor openInNewTab:n.path]; else [gApp.editor openPath:n.path];
+}
+
+- (void)createNote:(NSString *)name {
+    name = Trim(name);
+    if (!name.length || !gApp.vault) return;
+    NSString *dir;
+    if ([name containsString:@"/"]) {
+        dir = [gApp.vault.root stringByAppendingPathComponent:name.stringByDeletingLastPathComponent];
+        [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        name = name.lastPathComponent;
+    } else dir = [gApp defaultNoteDir];
+    NSString *p = [gApp createNoteIn:dir name:SafeName(name)];
+    if (p) [gApp.editor openPath:p];
+}
+
+- (void)controlTextDidChange:(NSNotification *)n { [self update]; }
+- (void)controlTextDidBeginEditing:(NSNotification *)n { self.needsDisplay = YES; }
+- (void)controlTextDidEndEditing:(NSNotification *)n { self.needsDisplay = YES; }
+
+- (BOOL)control:(NSControl *)c textView:(NSTextView *)tv doCommandBySelector:(SEL)sel {
+    NSInteger count = (NSInteger)self.items.count;
+    if (sel == @selector(moveDown:)) { if (count) self.sel = MIN(count - 1, self.sel + 1); self.needsDisplay = YES; return YES; }
+    if (sel == @selector(moveUp:)) { if (count) self.sel = MAX(0, self.sel - 1); self.needsDisplay = YES; return YES; }
+    if (sel == @selector(insertNewline:)) {
+        NSEventModifierFlags m = NSApp.currentEvent.modifierFlags;
+        if ((m & NSEventModifierFlagShift) && Trim(self.field.stringValue).length) [self createNote:self.field.stringValue];
+        else [self openItem:self.sel newTab:(m & NSEventModifierFlagCommand) != 0];
+        return YES;
+    }
+    if (sel == @selector(cancelOperation:)) { self.field.stringValue = @""; [self update]; return YES; }
+    return NO;
 }
 
 @end
