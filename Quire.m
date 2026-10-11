@@ -23,6 +23,12 @@ static NSString *const kSidebarW    = @"sidebarWidth";
 static NSString *const kSidebarHide = @"sidebarHidden";
 static NSString *const kTabs       = @"openTabs";
 static NSString *const kActiveTab  = @"activeTab";
+static NSString *const kLook       = @"look";           // 0 Quire, 1 Obsidian
+static NSString *const kLineNumbers = @"lineNumbers";
+static NSString *const kOutlineShown = @"outlineShown";
+
+static NSInteger gLook = 0;
+static BOOL gLineNumbers = NO;
 
 static NSUserDefaults *Defaults(void) { return NSUserDefaults.standardUserDefaults; }
 
@@ -39,6 +45,17 @@ static NSColor *qDesk, *qDot, *qPage, *qPageEdge, *qSide, *qSideHover, *qSideSel
                *qRule, *qHighlight, *qTag, *qBorder, *qQuoteBar, *qBox, *qBoxDone;
 
 static void InitPalette(void) {
+    if (gLook == 1) {   // Obsidian: flat greys, no desk
+        qDesk = Hex(0x1e1e1e);  qDot = Hex(0x1e1e1e);  qPage = Hex(0x1e1e1e);  qPageEdge = Hex(0x1e1e1e);
+        qSide = Hex(0x262626);  qSideHover = Hex(0x2d2d2d); qSideSel = Hex(0x363636); qSideActive = Hex(0x363636);
+        qText = Hex(0xdadada);  qHead = Hex(0xebebeb);  qBody2 = Hex(0xb3b3b3);  qFolder = Hex(0xcfcfcf);
+        qMuted = Hex(0x8c8c8c); qFaint = Hex(0x6b6b6b); qMark = Hex(0x5a5a5a);
+        qLink = Hex(0xe2e2e2);  qLinkLine = Hex(0x6b6b6b);
+        qCode = Hex(0xd4d4d4);  qCodeBg = Hex(0x262626); qInlineCodeBg = Hex(0x2e2e2e);
+        qRule = Hex(0x3a3a3a);  qHighlight = HexA(0xe8d9a8, 0.18); qTag = Hex(0xa8a8a8);
+        qBorder = Hex(0x333333); qQuoteBar = Hex(0x4a4a4a); qBox = Hex(0x6b6b6b); qBoxDone = Hex(0xdadada);
+        return;
+    }
     qDesk = Hex(0x121212);      qDot = Hex(0x262626);       qPage = Hex(0x121212);   qPageEdge = Hex(0x1c1c1c);
     qSide = Hex(0x161616);      qSideHover = Hex(0x1d1d1d); qSideSel = Hex(0x222222); qSideActive = Hex(0x262626);
     qText = Hex(0xd9d7d2);      qHead = Hex(0xf1efea);      qBody2 = Hex(0xa3a09a);  qFolder = Hex(0xbdbab4);
@@ -56,7 +73,7 @@ static NSFont *Serif(CGFloat size, BOOL bold, BOOL italic) {
     NSString *key = [NSString stringWithFormat:@"%.2f-%d-%d", size, bold, italic];
     NSFont *f = gFontCache[key];
     if (f) return f;
-    f = [NSFont fontWithName:@"Charter-Roman" size:size];
+    f = gLook == 1 ? [NSFont systemFontOfSize:size] : [NSFont fontWithName:@"Charter-Roman" size:size];
     if (!f) f = [NSFont fontWithName:@"Iowan Old Style" size:size];
     if (!f) f = [NSFont fontWithName:@"Georgia" size:size];
     if (!f) f = [NSFont systemFontOfSize:size];
@@ -72,6 +89,9 @@ static NSFont *UIFont(CGFloat size, NSFontWeight w) { return [NSFont systemFontO
 #pragma mark - Small helpers
 
 static NSString *Trim(NSString *s) { return [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]; }
+
+// macOS 14 stopped clipping views to their bounds by default; custom-drawn views need it back.
+static void Clip(NSView *v) { @try { [v setValue:@YES forKey:@"clipsToBounds"]; } @catch (NSException *e) {} }
 
 static NSImage *Symbol(NSString *name, CGFloat pt, NSFontWeight w) {
     NSImage *im = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
@@ -209,6 +229,7 @@ typedef NS_ENUM(NSInteger, QSort) { QSortNameAZ, QSortNameZA, QSortModNew, QSort
 
 @interface QIconButton : NSButton
 @property (nonatomic) BOOL active;
+- (void)refreshTint;
 + (instancetype)symbol:(NSString *)sym size:(CGFloat)pt tip:(NSString *)tip target:(id)t action:(SEL)a;
 @end
 
@@ -231,8 +252,15 @@ typedef NS_ENUM(NSInteger, QSort) { QSortNameAZ, QSortNameZA, QSortModNew, QSort
 
 @interface QTabBar : NSView
 @property (weak) QEditor *editor;
-@property CGFloat startX;
+@property CGFloat startX, endPad;
 - (void)refresh;
+@end
+
+@interface QOutlinePanel : NSView <NSTableViewDataSource, NSTableViewDelegate>
+@property (weak) QEditor *editor;
+- (void)reload;
+- (void)highlight;
+- (void)applyTheme;
 @end
 
 @interface QEditor : NSObject <NSTextStorageDelegate, NSTextViewDelegate, NSLayoutManagerDelegate, NSTextFieldDelegate>
@@ -241,7 +269,10 @@ typedef NS_ENUM(NSInteger, QSort) { QSortNameAZ, QSortNameZA, QSortModNew, QSort
 @property (strong) NSScrollView *scroll;
 @property (strong) QCanvasView *canvas;
 @property (strong) QTabBar *topBar;
-@property (strong) QIconButton *sidebarButton;
+@property (strong) QIconButton *sidebarButton, *outlineButton;
+@property (strong) QOutlinePanel *outlinePanel;
+@property (strong) NSData *lineStarts;
+@property BOOL outlineShown;
 @property (strong) NSMutableArray<QTab *> *tabs;
 @property NSInteger active;
 @property (strong) NSTextField *crumb, *status;
@@ -283,6 +314,10 @@ typedef NS_ENUM(NSInteger, QSort) { QSortNameAZ, QSortNameZA, QSortModNew, QSort
 - (void)saveTabs;
 - (void)dropMissingTabs;
 - (void)openLink:(NSString *)target newTab:(BOOL)nt;
+- (void)revealHeading:(NSInteger)i;
+- (void)toggleOutline;
+- (void)applyTheme;
+- (void)layout;
 - (BOOL)isHiddenChar:(NSUInteger)ci;
 @end
 
@@ -295,6 +330,7 @@ typedef NS_ENUM(NSInteger, QSort) { QSortNameAZ, QSortNameZA, QSortModNew, QSort
 - (void)newNote;
 - (void)newFolder;
 - (void)refreshFooter;
+- (void)applyTheme;
 @end
 
 @interface QSwitcher : NSPanel <NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate>
@@ -323,6 +359,7 @@ typedef NS_ENUM(NSInteger, QSort) { QSortNameAZ, QSortNameZA, QSortModNew, QSort
 - (NSString *)createNoteIn:(NSString *)dir name:(NSString *)name;
 - (NSString *)defaultNoteDir;
 - (void)toggleSidebar:(id)sender;
+- (void)applyLook;
 @end
 
 #pragma mark - Vault
@@ -583,6 +620,39 @@ static NSMutableDictionary *gTextCache;   // path -> @[mtime, text]
 }
 @end
 
+@interface QRowView : NSTableRowView
+@property NSInteger level;
+@property BOOL current, hover;
+@property CGFloat guideBase, indent;
+@end
+
+@implementation QRowView
+- (void)drawBackgroundInRect:(NSRect)r {
+    [qSide setFill];
+    NSRectFill(r);
+    NSRect box = NSInsetRect(self.bounds, 8, 1);
+    if (self.current) RoundRect(box, 6, qSideSel);
+    else if (self.hover) RoundRect(box, 6, qSideHover);
+    if (self.level > 0 && self.indent > 0) {
+        [Hex(0x2a2a2a) setFill];
+        for (NSInteger k = 0; k < self.level; k++) {
+            CGFloat x = round(self.guideBase + k * self.indent);
+            NSRectFill(NSMakeRect(x, 0, 1, NSHeight(self.bounds)));
+        }
+    }
+}
+- (void)drawSelectionInRect:(NSRect)r {}
+- (BOOL)isEmphasized { return NO; }
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas];
+    for (NSTrackingArea *ta in self.trackingAreas.copy) [self removeTrackingArea:ta];
+    [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
+        options:NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect owner:self userInfo:nil]];
+}
+- (void)mouseEntered:(NSEvent *)e { self.hover = YES; self.needsDisplay = YES; }
+- (void)mouseExited:(NSEvent *)e { self.hover = NO; self.needsDisplay = YES; }
+@end
+
 @implementation QDragBar
 - (BOOL)mouseDownCanMoveWindow { return YES; }
 - (BOOL)isFlipped { return YES; }
@@ -628,55 +698,89 @@ static BOOL IsFence(NSString *s, NSRange lr) {
     return [s characterAtIndex:i + 1] == c && [s characterAtIndex:i + 2] == c;
 }
 
-// Fenced code blocks, each from its opening fence line to the end of its closing fence line.
+static BOOL IsFenceBuf(const unichar *b, NSUInteger i, NSUInteger end) {
+    NSUInteger sp = 0;
+    while (i < end && b[i] == ' ' && sp < 4) { i++; sp++; }
+    if (sp > 3 || i + 3 > end) return NO;
+    unichar c = b[i];
+    if (c != '`' && c != '~') return NO;
+    return b[i + 1] == c && b[i + 2] == c;
+}
+
+static unichar *CopyChars(NSString *s, NSUInteger *len) {
+    *len = s.length;
+    unichar *b = malloc(sizeof(unichar) * (*len + 1));
+    [s getCharacters:b range:NSMakeRange(0, *len)];
+    return b;
+}
+
+// Fenced code blocks, each from its opening fence line to the end of its closing fence line. Scans raw characters: fast on long notes.
 static NSArray<NSValue *> *CodeBlocks(NSString *s, NSRange front) {
+    NSUInteger len = 0;
+    unichar *b = CopyChars(s, &len);
     NSMutableArray *out = [NSMutableArray array];
-    NSUInteger len = s.length, pos = (front.location == NSNotFound) ? 0 : NSMaxRange(front), open = NSNotFound;
+    NSUInteger pos = (front.location == NSNotFound) ? 0 : NSMaxRange(front), open = NSNotFound;
     while (pos < len) {
-        NSRange lr = [s lineRangeForRange:NSMakeRange(pos, 0)];
-        if (lr.length == 0) break;
-        if (IsFence(s, lr)) {
-            if (open == NSNotFound) open = lr.location;
-            else { [out addObject:[NSValue valueWithRange:NSMakeRange(open, NSMaxRange(lr) - open)]]; open = NSNotFound; }
+        NSUInteger e = pos;
+        while (e < len && b[e] != '\n') e++;
+        NSUInteger end = e < len ? e + 1 : len;
+        if (IsFenceBuf(b, pos, e)) {
+            if (open == NSNotFound) open = pos;
+            else { [out addObject:[NSValue valueWithRange:NSMakeRange(open, end - open)]]; open = NSNotFound; }
         }
-        pos = NSMaxRange(lr);
+        pos = end;
     }
     if (open != NSNotFound) [out addObject:[NSValue valueWithRange:NSMakeRange(open, len - open)]];
+    free(b);
     return out;
 }
 
+// Start of every line, for line numbers.
+static NSData *LineStarts(NSString *s) {
+    NSUInteger len = 0;
+    unichar *b = CopyChars(s, &len);
+    NSMutableData *d = [NSMutableData data];
+    NSUInteger zero = 0;
+    [d appendBytes:&zero length:sizeof(NSUInteger)];
+    for (NSUInteger i = 0; i < len; i++) if (b[i] == '\n' && i + 1 <= len) { NSUInteger p = i + 1; if (p < len) [d appendBytes:&p length:sizeof(NSUInteger)]; }
+    free(b);
+    return d;
+}
+
 static NSArray<QHeading *> *Headings(NSString *s, NSArray<NSValue *> *blocks, NSRange front) {
+    NSUInteger len = 0;
+    unichar *b = CopyChars(s, &len);
     NSMutableArray<QHeading *> *out = [NSMutableArray array];
     NSMutableArray<QHeading *> *stack = [NSMutableArray array];
-    NSUInteger len = s.length, pos = (front.location == NSNotFound) ? 0 : NSMaxRange(front), bi = 0;
+    NSUInteger pos = (front.location == NSNotFound) ? 0 : NSMaxRange(front), bi = 0;
     while (pos < len) {
-        NSUInteger start = 0, end = 0, cend = 0;
-        [s getLineStart:&start end:&end contentsEnd:&cend forRange:NSMakeRange(pos, 0)];
+        NSUInteger e = pos;
+        while (e < len && b[e] != '\n') e++;
+        NSUInteger cend = (e > pos && b[e - 1] == '\r') ? e - 1 : e;
+        NSUInteger start = pos;
+        pos = e < len ? e + 1 : len;
+        if (cend <= start || b[start] != '#') continue;
         while (bi < blocks.count && NSMaxRange(blocks[bi].rangeValue) <= start) bi++;
-        BOOL inCode = bi < blocks.count && NSLocationInRange(start, blocks[bi].rangeValue);
-        if (!inCode && cend > start && [s characterAtIndex:start] == '#') {
-            NSUInteger n = 0;
-            while (start + n < cend && n < 7 && [s characterAtIndex:start + n] == '#') n++;
-            if (n <= 6 && (start + n == cend || [s characterAtIndex:start + n] == ' ' || [s characterAtIndex:start + n] == '\t')) {
-                QHeading *h = [QHeading new];
-                h.line = NSMakeRange(start, cend - start);
-                h.level = (NSInteger)n;
-                while (stack.count && stack.lastObject.level >= h.level) [stack removeLastObject];
-                NSString *text = Trim([s substringWithRange:NSMakeRange(start + n, cend - start - n)]);
-                h.key = [NSString stringWithFormat:@"%@/%lu:%@", stack.count ? stack.lastObject.key : @"", (unsigned long)n, text];
-                [stack addObject:h];
-                [out addObject:h];
-            }
-        }
-        if (end <= pos) break;
-        pos = end;
+        if (bi < blocks.count && NSLocationInRange(start, blocks[bi].rangeValue)) continue;
+        NSUInteger n = 0;
+        while (start + n < cend && n < 7 && b[start + n] == '#') n++;
+        if (n > 6 || !(start + n == cend || b[start + n] == ' ' || b[start + n] == '\t')) continue;
+        QHeading *h = [QHeading new];
+        h.line = NSMakeRange(start, cend - start);
+        h.level = (NSInteger)n;
+        while (stack.count && stack.lastObject.level >= h.level) [stack removeLastObject];
+        NSString *text = Trim([[NSString alloc] initWithCharacters:b + start + n length:cend - start - n]);
+        h.key = [NSString stringWithFormat:@"%@/%lu:%@", stack.count ? stack.lastObject.key : @"", (unsigned long)n, text];
+        [stack addObject:h];
+        [out addObject:h];
     }
+    free(b);
     for (NSUInteger i = 0; i < out.count; i++) {
         QHeading *h = out[i];
         NSUInteger stop = len;
         for (NSUInteger j = i + 1; j < out.count; j++) if (out[j].level <= h.level) { stop = out[j].line.location; break; }
         NSUInteger from = NSMaxRange(h.line);
-        NSUInteger to = (stop < len) ? stop - 1 : len;   // keep the newline that ends the folded block
+        NSUInteger to = (stop < len) ? stop - 1 : len;
         h.hide = (to > from) ? NSMakeRange(from, to - from) : NSMakeRange(from, 0);
     }
     return out;
@@ -765,8 +869,20 @@ static void AddTrait(NSTextStorage *ts, NSRange r, NSFontTraitMask t) {
     }];
 }
 
+static NSRange gActiveLine = {NSNotFound, 0};
+static BOOL LineActive(NSUInteger lineStart) { return gActiveLine.location != NSNotFound && NSLocationInRange(lineStart, gActiveLine); }
+
+// Syntax characters: faint on the caret's line, gone everywhere else (Obsidian-style live preview).
+static void Mark(NSTextStorage *ts, NSRange r, BOOL active) {
+    if (!r.length) return;
+    if (active) { Faint(ts, r); return; }
+    [ts addAttributes:@{NSFontAttributeName: [NSFont systemFontOfSize:0.01], NSForegroundColorAttributeName: NSColor.clearColor,
+                        NSBackgroundColorAttributeName: NSColor.clearColor} range:r];
+}
+
 static void StyleInline(NSTextStorage *ts, NSString *line, NSUInteger o, NSUInteger from, CGFloat size) {
     if (from >= line.length) return;
+    BOOL active = LineActive(o);
     NSRange r = NSMakeRange(from, line.length - from);
     NSMutableIndexSet *taken = [NSMutableIndexSet indexSet];
     BOOL (^isFree)(NSRange) = ^BOOL(NSRange x) { return ![taken intersectsIndexesInRange:x]; };
@@ -776,8 +892,8 @@ static void StyleInline(NSTextStorage *ts, NSString *line, NSUInteger o, NSUInte
         NSRange all = m.range, tick = [m rangeAtIndex:1], inner = [m rangeAtIndex:2];
         [ts addAttributes:@{NSFontAttributeName: Mono(round(size * 0.84)), NSForegroundColorAttributeName: qCode,
                             NSBackgroundColorAttributeName: qInlineCodeBg} range:at(inner)];
-        Faint(ts, at(NSMakeRange(all.location, tick.length)));
-        Faint(ts, at(NSMakeRange(NSMaxRange(all) - tick.length, tick.length)));
+        Mark(ts, at(NSMakeRange(all.location, tick.length)), active);
+        Mark(ts, at(NSMakeRange(NSMaxRange(all) - tick.length, tick.length)), active);
         [taken addIndexesInRange:all];
     }
     for (NSTextCheckingResult *m in [rxWiki matchesInString:line options:0 range:r]) {
@@ -786,11 +902,11 @@ static void StyleInline(NSTextStorage *ts, NSString *line, NSUInteger o, NSUInte
         NSString *body = [line substringWithRange:inner];
         NSRange bar = [body rangeOfString:@"|"];
         NSString *target = bar.location == NSNotFound ? body : [body substringToIndex:bar.location];
-        Faint(ts, at(NSMakeRange(all.location, inner.location - all.location)));
-        Faint(ts, at(NSMakeRange(NSMaxRange(inner), NSMaxRange(all) - NSMaxRange(inner))));
+        Mark(ts, at(NSMakeRange(all.location, inner.location - all.location)), active);
+        Mark(ts, at(NSMakeRange(NSMaxRange(inner), NSMaxRange(all) - NSMaxRange(inner))), active);
         NSRange shown = inner;
         if (bar.location != NSNotFound) {
-            Faint(ts, at(NSMakeRange(inner.location, bar.location + 1)));
+            Mark(ts, at(NSMakeRange(inner.location, bar.location + 1)), active);
             shown = NSMakeRange(inner.location + bar.location + 1, inner.length - bar.location - 1);
         }
         if (shown.length) {
@@ -803,8 +919,8 @@ static void StyleInline(NSTextStorage *ts, NSString *line, NSUInteger o, NSUInte
         if (!isFree(m.range)) continue;
         NSRange all = m.range, text = [m rangeAtIndex:2], url = [m rangeAtIndex:3];
         NSString *u = [line substringWithRange:url];
-        Faint(ts, at(NSMakeRange(all.location, text.location - all.location)));
-        Faint(ts, at(NSMakeRange(NSMaxRange(text), NSMaxRange(all) - NSMaxRange(text))));
+        Mark(ts, at(NSMakeRange(all.location, text.location - all.location)), active);
+        Mark(ts, at(NSMakeRange(NSMaxRange(text), NSMaxRange(all) - NSMaxRange(text))), active);
         if (text.length) {
             LinkStyle(ts, at(text));
             BOOL web = [u containsString:@"://"] || [u hasPrefix:@"mailto:"];
@@ -822,29 +938,29 @@ static void StyleInline(NSTextStorage *ts, NSString *line, NSUInteger o, NSUInte
         if (!isFree(m.range)) continue;
         NSRange mk = [m rangeAtIndex:1], inner = [m rangeAtIndex:2];
         AddTrait(ts, at(inner), NSBoldFontMask);
-        Faint(ts, at(NSMakeRange(m.range.location, mk.length)));
-        Faint(ts, at(NSMakeRange(NSMaxRange(m.range) - mk.length, mk.length)));
+        Mark(ts, at(NSMakeRange(m.range.location, mk.length)), active);
+        Mark(ts, at(NSMakeRange(NSMaxRange(m.range) - mk.length, mk.length)), active);
     }
     for (NSRegularExpression *rx in @[rxItalicStar, rxItalicUnd]) {
         for (NSTextCheckingResult *m in [rx matchesInString:line options:0 range:r]) {
             if (!isFree(m.range)) continue;
             AddTrait(ts, at([m rangeAtIndex:1]), NSItalicFontMask);
-            Faint(ts, at(NSMakeRange(m.range.location, 1)));
-            Faint(ts, at(NSMakeRange(NSMaxRange(m.range) - 1, 1)));
+            Mark(ts, at(NSMakeRange(m.range.location, 1)), active);
+            Mark(ts, at(NSMakeRange(NSMaxRange(m.range) - 1, 1)), active);
         }
     }
     for (NSTextCheckingResult *m in [rxStrike matchesInString:line options:0 range:r]) {
         if (!isFree(m.range)) continue;
         [ts addAttributes:@{NSStrikethroughStyleAttributeName: @(NSUnderlineStyleSingle), NSStrikethroughColorAttributeName: qMuted,
                             NSForegroundColorAttributeName: qBody2} range:at([m rangeAtIndex:1])];
-        Faint(ts, at(NSMakeRange(m.range.location, 2)));
-        Faint(ts, at(NSMakeRange(NSMaxRange(m.range) - 2, 2)));
+        Mark(ts, at(NSMakeRange(m.range.location, 2)), active);
+        Mark(ts, at(NSMakeRange(NSMaxRange(m.range) - 2, 2)), active);
     }
     for (NSTextCheckingResult *m in [rxHigh matchesInString:line options:0 range:r]) {
         if (!isFree(m.range)) continue;
         [ts addAttribute:NSBackgroundColorAttributeName value:qHighlight range:at([m rangeAtIndex:1])];
-        Faint(ts, at(NSMakeRange(m.range.location, 2)));
-        Faint(ts, at(NSMakeRange(NSMaxRange(m.range) - 2, 2)));
+        Mark(ts, at(NSMakeRange(m.range.location, 2)), active);
+        Mark(ts, at(NSMakeRange(NSMaxRange(m.range) - 2, 2)), active);
     }
     for (NSTextCheckingResult *m in [rxTag matchesInString:line options:0 range:r]) {
         if (!isFree(m.range)) continue;
@@ -882,8 +998,7 @@ static void StyleLine(NSTextStorage *ts, NSString *s, NSRange lr, NSRange cr, NS
         CGFloat size = HeadingSize(level);
         [ts addAttributes:@{NSFontAttributeName: Serif(size, YES, NO), NSForegroundColorAttributeName: level >= 6 ? qBody2 : qHead,
                             NSParagraphStyleAttributeName: Para(@"h", 0, level), QHeadingAttr: @(level)} range:lr];
-        Faint(ts, NSMakeRange(o, m.range.length));
-        [ts addAttribute:QMarkerAttr value:@YES range:NSMakeRange(o, m.range.length)];
+        Mark(ts, NSMakeRange(o, m.range.length), LineActive(lr.location));
         StyleInline(ts, line, o, m.range.length, size);
         return;
     }
@@ -949,7 +1064,7 @@ static void StyleRange(NSTextStorage *ts, NSRange range, NSArray<NSValue *> *blo
 
 #pragma mark - The page
 
-static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, kDotStep = 20;
+static const CGFloat kTopPad = 44, kTitleH = 64, kTitleGap = 10, kPagePad = 60, kDotStep = 20;
 
 @implementation QTextView
 
@@ -957,7 +1072,7 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
 
 // Page width 0 means full width: text runs edge to edge with a margin for the fold arrows.
 - (CGFloat)insetX {
-    if (self.pageWidth <= 0) return 64;
+    if (self.pageWidth <= 0) return gLineNumbers ? 104 : 64;
     return MAX(kPagePad + 24, floor((NSWidth(self.bounds) - self.pageWidth) / 2));
 }
 
@@ -1020,7 +1135,7 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     NSInteger x0 = (NSInteger)floor(NSMinX(rect) / kDotStep), x1 = (NSInteger)ceil(NSMaxX(rect) / kDotStep);
     NSInteger y0 = (NSInteger)floor(NSMinY(rect) / kDotStep), y1 = (NSInteger)ceil(NSMaxY(rect) / kDotStep);
     NSInteger cap = (x1 - x0 + 1) * (y1 - y0 + 1);
-    if (cap > 0 && cap < 200000) {
+    if (gLook == 0 && cap > 0 && cap < 200000) {
         NSRect *dots = malloc(sizeof(NSRect) * (size_t)cap);
         NSInteger n = 0;
         for (NSInteger yi = y0; yi <= y1; yi++)
@@ -1036,9 +1151,11 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
     // The page and its hairline edges.
     [qPage setFill];
     NSRectFill(NSIntersectionRect(page, rect));
-    [qPageEdge setFill];
-    NSRectFill(NSIntersectionRect(NSMakeRect(NSMinX(page) - 1, 0, 1, NSHeight(self.bounds)), rect));
-    NSRectFill(NSIntersectionRect(NSMakeRect(NSMaxX(page), 0, 1, NSHeight(self.bounds)), rect));
+    if (gLook == 0) {
+        [qPageEdge setFill];
+        NSRectFill(NSIntersectionRect(NSMakeRect(NSMinX(page) - 1, 0, 1, NSHeight(self.bounds)), rect));
+        NSRectFill(NSIntersectionRect(NSMakeRect(NSMaxX(page), 0, 1, NSHeight(self.bounds)), rect));
+    }
 
     if (!self.string.length) return;
     NSTextStorage *ts = self.textStorage;
@@ -1096,6 +1213,28 @@ static const CGFloat kTopPad = 54, kTitleH = 50, kTitleGap = 14, kPagePad = 60, 
             [p stroke];
         }
     }];
+    // Line numbers, one per line of the file, right-aligned in the gutter.
+    if (gLineNumbers && self.editor.lineStarts.length) {
+        const NSUInteger *ls = self.editor.lineStarts.bytes;
+        NSUInteger count = self.editor.lineStarts.length / sizeof(NSUInteger), len = self.string.length;
+        NSUInteger lo = 0, hi = count;
+        while (lo < hi) { NSUInteger mid = (lo + hi) / 2; if (ls[mid] < vis.location) lo = mid + 1; else hi = mid; }
+        NSFont *nf = Mono(11);
+        NSDictionary *na = @{NSFontAttributeName: nf, NSForegroundColorAttributeName: qFaint};
+        NSLayoutManager *lm = self.layoutManager;
+        for (NSUInteger i = lo; i < count && ls[i] <= NSMaxRange(vis) && ls[i] < len; i++) {
+            NSUInteger st = ls[i];
+            if ([self.editor isHiddenChar:st]) continue;
+            NSUInteger gi = [lm glyphIndexForCharacterAtIndex:st];
+            if (gi >= lm.numberOfGlyphs) break;
+            NSRect frag = [lm lineFragmentRectForGlyphAtIndex:gi effectiveRange:NULL];
+            NSPoint loc = [lm locationForGlyphAtIndex:gi];
+            CGFloat baseline = o.y + NSMinY(frag) + loc.y;
+            NSString *num = [NSString stringWithFormat:@"%lu", (unsigned long)(i + 1)];
+            NSSize sz = [num sizeWithAttributes:na];
+            [num drawAtPoint:NSMakePoint(o.x - 30 - sz.width, baseline - nf.ascender) withAttributes:na];
+        }
+    }
     // Fold chevrons and folded markers.
     NSArray<QHeading *> *hs = self.editor.headings;
     for (NSUInteger i = 0; i < hs.count; i++) {
@@ -1431,7 +1570,7 @@ static NSString *TodayString(NSString *fmt) {
 }
 - (NSRect)tabRect:(NSInteger)i {
     NSInteger n = (NSInteger)self.editor.tabs.count;
-    CGFloat avail = NSWidth(self.bounds) - self.startX - 44;
+    CGFloat avail = NSWidth(self.bounds) - self.startX - 44 - self.endPad;
     CGFloat w = floor(MIN(220, MAX(84, avail / MAX(1, n))));
     return NSMakeRect(self.startX + i * w, 5, w, NSHeight(self.bounds) - 5);
 }
@@ -1558,6 +1697,157 @@ static NSString *TodayString(NSString *fmt) {
 - (void)menuCloseOthers:(NSMenuItem *)it { [self.editor closeOtherTabs:it.tag]; }
 @end
 
+#pragma mark - Outline panel
+
+@interface QOutlinePanel ()
+@property (strong) NSTableView *table;
+@property (strong) NSScrollView *sv;
+@property (strong) NSTextField *header, *empty;
+@property (strong) NSArray<QHeading *> *items;
+@property NSInteger minLevel, current;
+@end
+
+@implementation QOutlinePanel
+
+- (BOOL)isFlipped { return YES; }
+
+- (instancetype)initWithFrame:(NSRect)f {
+    if (!(self = [super initWithFrame:f])) return nil;
+    self.wantsLayer = YES;
+    Clip(self);
+    self.header = Label(@"Outline", UIFont(12, NSFontWeightSemibold), qMuted);
+    [self addSubview:self.header];
+    self.empty = Label(@"No headings in this note.", UIFont(12.5, NSFontWeightRegular), qFaint);
+    [self addSubview:self.empty];
+    NSTableView *t = [[NSTableView alloc] initWithFrame:NSZeroRect];
+    NSTableColumn *c = [[NSTableColumn alloc] initWithIdentifier:@"h"];
+    c.resizingMask = NSTableColumnAutoresizingMask;
+    [t addTableColumn:c];
+    t.headerView = nil;
+    t.style = NSTableViewStylePlain;
+    t.rowHeight = 26;
+    t.intercellSpacing = NSMakeSize(0, 0);
+    t.selectionHighlightStyle = NSTableViewSelectionHighlightStyleNone;
+    t.focusRingType = NSFocusRingTypeNone;
+    t.columnAutoresizingStyle = NSTableViewUniformColumnAutoresizingStyle;
+    t.dataSource = self; t.delegate = self;
+    t.target = self; t.action = @selector(clicked:);
+    self.table = t;
+    NSScrollView *sv = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    sv.documentView = t;
+    sv.hasVerticalScroller = YES; sv.autohidesScrollers = YES; sv.scrollerStyle = NSScrollerStyleOverlay;
+    sv.borderType = NSNoBorder;
+    self.sv = sv;
+    [self addSubview:sv];
+    self.current = -1;
+    [self applyTheme];
+    return self;
+}
+
+- (void)applyTheme {
+    self.layer.backgroundColor = qSide.CGColor;
+    self.table.backgroundColor = qSide;
+    self.sv.backgroundColor = qSide;
+    self.header.textColor = qMuted;
+    self.empty.textColor = qFaint;
+    [self.table reloadData];
+    self.needsDisplay = YES;
+}
+
+- (void)resizeSubviewsWithOldSize:(NSSize)old { [self place]; }
+- (void)layout { [super layout]; [self place]; }
+- (void)place {
+    NSRect b = self.bounds;
+    self.header.frame = NSMakeRect(18, 10, NSWidth(b) - 36, 16);
+    self.empty.frame = NSMakeRect(18, 40, NSWidth(b) - 36, 16);
+    self.sv.frame = NSMakeRect(1, 34, NSWidth(b) - 1, NSHeight(b) - 34);
+    [self.table sizeLastColumnToFit];
+}
+
+- (void)drawRect:(NSRect)r {
+    [qSide setFill];
+    NSRectFill(r);
+    [Hex(gLook == 1 ? 0x333333 : 0x1f1f1f) setFill];
+    NSRectFill(NSMakeRect(0, 0, 1, NSHeight(self.bounds)));
+}
+
+- (void)reload {
+    BOOL md = self.editor.path && ![self.editor.path.pathExtension.lowercaseString isEqualToString:@"canvas"];
+    self.items = md ? self.editor.headings : @[];
+    NSInteger lo = 6;
+    for (QHeading *h in self.items) lo = MIN(lo, h.level);
+    self.minLevel = lo;
+    self.empty.stringValue = md ? @"No headings in this note." : @"Nothing to outline here.";
+    self.empty.hidden = self.items.count > 0;
+    [self.table reloadData];
+    self.current = -1;
+    [self highlight];
+}
+
+- (void)highlight {
+    NSUInteger loc = self.editor.textView.selectedRange.location;
+    NSInteger cur = -1;
+    for (NSUInteger i = 0; i < self.items.count; i++) { if (self.items[i].line.location <= loc) cur = (NSInteger)i; else break; }
+    if (cur == self.current) return;
+    self.current = cur;
+    [self.table enumerateAvailableRowViewsUsingBlock:^(NSTableRowView *rv, NSInteger row) {
+        ((QRowView *)rv).current = (row == cur);
+        rv.needsDisplay = YES;
+    }];
+    if (cur >= 0) [self.table scrollRowToVisible:cur];
+}
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)t { return (NSInteger)self.items.count; }
+
+- (NSTableRowView *)tableView:(NSTableView *)t rowViewForRow:(NSInteger)row {
+    QRowView *rv = [QRowView new];
+    rv.current = (row == self.current);
+    return rv;
+}
+
+- (CGFloat)indentFor:(QHeading *)h { return 14 + (h.level - self.minLevel) * 14; }
+
+- (NSView *)tableView:(NSTableView *)t viewForTableColumn:(NSTableColumn *)col row:(NSInteger)row {
+    NSTableCellView *c = [t makeViewWithIdentifier:@"oh" owner:self];
+    if (!c) {
+        c = [[NSTableCellView alloc] initWithFrame:NSMakeRect(0, 0, 220, 26)];
+        c.identifier = @"oh";
+        NSTextField *chev = Label(@"", UIFont(10, NSFontWeightBold), qFaint);
+        chev.tag = 7;
+        NSTextField *tf = Label(@"", UIFont(13, NSFontWeightRegular), qBody2);
+        c.textField = tf;
+        [c addSubview:chev]; [c addSubview:tf];
+    }
+    QHeading *h = self.items[(NSUInteger)row];
+    NSString *line = [self.editor.textView.string substringWithRange:h.line];
+    NSString *text = Trim([line substringFromIndex:MIN(line.length, (NSUInteger)h.level)]);
+    CGFloat x = [self indentFor:h];
+    NSTextField *chev = [c viewWithTag:7];
+    BOOL folded = [self.editor.folded containsObject:h.key];
+    chev.stringValue = h.hide.length ? (folded ? @"›" : @"⌄") : @"";
+    chev.textColor = folded ? qMuted : qFaint;
+    chev.frame = NSMakeRect(x - 12, 5, 12, 16);
+    c.textField.stringValue = text.length ? text : @"Untitled heading";
+    c.textField.font = UIFont(h.level <= 2 ? 13.5 : 13, h.level <= 2 ? NSFontWeightMedium : NSFontWeightRegular);
+    c.textField.textColor = h.level <= 2 ? qText : qBody2;
+    c.textField.frame = NSMakeRect(x + 4, 4, MAX(40, NSWidth(t.bounds) - x - 14), 18);
+    return c;
+}
+
+- (void)clicked:(id)sender {
+    NSInteger row = self.table.clickedRow;
+    if (row < 0 || row >= (NSInteger)self.items.count) return;
+    QHeading *h = self.items[(NSUInteger)row];
+    NSInteger idx = (NSInteger)[self.editor.headings indexOfObjectIdenticalTo:h];
+    if (idx == NSNotFound) return;
+    NSPoint p = [self.table convertPoint:NSApp.currentEvent.locationInWindow fromView:nil];
+    CGFloat x = [self indentFor:h];
+    if (h.hide.length && p.x < x + 2) [self.editor toggleFoldAtHeading:idx];
+    else [self.editor revealHeading:idx];
+}
+
+@end
+
 #pragma mark - Editor
 
 @interface QEditor ()
@@ -1566,8 +1856,7 @@ static NSString *TodayString(NSString *fmt) {
 @property BOOL styling, loading;
 @property (strong) NSTimer *saveTimer;
 @property (strong) NSDate *savedMtime;
-@property NSUInteger words, chars;
-@property NSRange activeLine;   // the caret's line, where hidden syntax shows
+@property NSUInteger words, chars, wordGen, styleGen, styleFocus, chunkPos;
 @property BOOL readOnly;
 @end
 
@@ -1602,6 +1891,9 @@ static NSString *TodayString(NSString *fmt) {
     self.forwardButton = [QIconButton symbol:@"chevron.right" size:12 tip:@"Forward (⌘])" target:self action:@selector(goForward)];
     self.crumb = Label(@"", UIFont(12, NSFontWeightRegular), qMuted);
     [bar addSubview:self.backButton]; [bar addSubview:self.forwardButton];
+    self.outlineButton = [QIconButton symbol:@"list.bullet.indent" size:13 tip:@"Outline (⌥⌘O)" target:self action:@selector(toggleOutline)];
+    [bar addSubview:self.outlineButton];
+    Clip(bar);
     [v addSubview:bar];
 
     // The page.
@@ -1663,6 +1955,7 @@ static NSString *TodayString(NSString *fmt) {
     title.lineBreakMode = NSLineBreakByTruncatingTail;
     title.cell.usesSingleLineMode = YES;
     title.cell.scrollable = YES;
+    title.cell.wraps = NO;
     title.delegate = self;
     [tv addSubview:title];
     tv.titleField = title;
@@ -1674,7 +1967,14 @@ static NSString *TodayString(NSString *fmt) {
 
     self.canvas = [[QCanvasView alloc] initWithFrame:NSMakeRect(0, 0, 900, 660)];
     self.canvas.hidden = YES;
+    Clip(self.canvas);
     [v addSubview:self.canvas];
+
+    self.outlinePanel = [[QOutlinePanel alloc] initWithFrame:NSMakeRect(0, 0, 240, 600)];
+    self.outlinePanel.editor = self;
+    self.outlineShown = [Defaults() boolForKey:kOutlineShown];
+    self.outlinePanel.hidden = !self.outlineShown;
+    [v addSubview:self.outlinePanel];
 
     self.status = Label(@"", UIFont(11.5, NSFontWeightRegular), qFaint);
     self.status.alignment = NSTextAlignmentRight;
@@ -1713,14 +2013,20 @@ static NSString *TodayString(NSString *fmt) {
     self.forwardButton.frame = NSMakeRect(left + 26, 5, 26, 26);
     self.topBar.startX = left + 62;
     [self.topBar refresh];
-    NSRect body = flipped ? NSMakeRect(0, barH, NSWidth(b), NSHeight(b) - barH) : NSMakeRect(0, 0, NSWidth(b), NSHeight(b) - barH);
+    CGFloat ow = self.outlineShown ? 250 : 0;
+    self.outlineButton.frame = NSMakeRect(NSWidth(b) - 40, 5, 30, 26);
+    self.outlineButton.active = self.outlineShown;
+    self.topBar.endPad = 44;
+    NSRect body = flipped ? NSMakeRect(0, barH, NSWidth(b) - ow, NSHeight(b) - barH) : NSMakeRect(0, 0, NSWidth(b) - ow, NSHeight(b) - barH);
+    self.outlinePanel.frame = NSMakeRect(NSWidth(b) - ow, NSMinY(body), ow, NSHeight(body));
+    self.outlinePanel.hidden = !self.outlineShown;
     self.scroll.frame = body;
     self.canvas.frame = body;
     self.emptyView.frame = body;
     NSTextField *e1 = [self.emptyView viewWithTag:1], *e2 = [self.emptyView viewWithTag:2];
     e1.frame = NSMakeRect(0, NSHeight(body) / 2 + 6, NSWidth(body), 34);
     e2.frame = NSMakeRect(20, NSHeight(body) / 2 - 22, NSWidth(body) - 40, 20);
-    self.status.frame = NSMakeRect(NSWidth(b) - 320, 10, 300, 16);
+    self.status.frame = NSMakeRect(NSWidth(body) - 320, 10, 300, 16);
     self.textView.minSize = NSMakeSize(0, NSHeight(body));
     [self.textView updateGeometry];
     self.textView.needsDisplay = YES;
@@ -1751,9 +2057,30 @@ static NSString *TodayString(NSString *fmt) {
 
 - (void)openPath:(NSString *)path { [self openPath:path history:YES]; }
 
+// A note lives in at most one tab: opening it again goes to that tab.
+- (NSInteger)tabIndexForPath:(NSString *)path {
+    for (NSUInteger i = 0; i < self.tabs.count; i++)
+        if ((NSInteger)i != self.active && [self.tabs[i].path isEqualToString:path]) return (NSInteger)i;
+    return -1;
+}
+
 - (void)openPath:(NSString *)path history:(BOOL)h {
     path = path.stringByStandardizingPath;
     if (!path) return;
+    NSInteger other = [self tabIndexForPath:path];
+    if (other >= 0) {
+        // An empty tab that was only opened to show this note is closed rather than left behind.
+        if (!self.tab.path && self.tabs.count > 1) {
+            NSInteger cur = self.active;
+            [self.tabs removeObjectAtIndex:(NSUInteger)cur];
+            if (other > cur) other -= 1;
+            self.active = other;
+            [self showTab];
+            return;
+        }
+        [self selectTab:other];
+        return;
+    }
     if ([path isEqualToString:self.path]) {
         self.tab.path = path;
         [self updateCrumb];
@@ -1784,6 +2111,7 @@ static NSString *TodayString(NSString *fmt) {
     [self updateStatus];
     [self saveTabs];
     [gApp.sidebar revealPath:path];
+    if (self.outlineShown) [self.outlinePanel reload];
 }
 
 - (void)loadText {
@@ -1796,6 +2124,9 @@ static NSString *TodayString(NSString *fmt) {
     [self.folded removeAllObjects];
     if ([keys isKindOfClass:NSArray.class]) [self.folded addObjectsFromArray:keys];
     self.hidden = @[];
+    gActiveLine = NSMakeRange(NSNotFound, 0);
+    NSNumber *caret = [Defaults() dictionaryForKey:kCarets][[gApp.vault rel:self.path]];
+    self.styleFocus = MIN((NSUInteger)caret.unsignedIntegerValue, text.length);
     self.loading = YES;
     NSTextStorage *ts = self.textView.textStorage;
     [ts beginEditing];
@@ -1805,7 +2136,7 @@ static NSString *TodayString(NSString *fmt) {
     [self.textView.undoManager removeAllActions];
     [self refreshStructureInvalidating:YES];
     self.textView.titleField.stringValue = [self.path.lastPathComponent stringByDeletingPathExtension];
-    self.words = WordCount(text);
+    [self countWords:text];
     self.chars = text.length;
 }
 
@@ -1840,6 +2171,7 @@ static NSString *TodayString(NSString *fmt) {
     [self.textView.undoManager removeAllActions];
     self.headings = @[]; self.hidden = @[];
     [self showEmpty:YES];
+    if (self.outlineShown) [self.outlinePanel reload];
 }
 
 - (void)textDidChange:(NSNotification *)n {
@@ -1877,7 +2209,7 @@ static NSString *TodayString(NSString *fmt) {
     self.savedMtime = ModDate(self.path);
     self.dirty = NO;
     [QIndex forget:self.path];
-    self.words = WordCount(text);
+    [self countWords:text];
     self.chars = text.length;
     [self updateStatus];
 }
@@ -1922,6 +2254,19 @@ static NSString *MovedPath(NSString *p, NSString *from, NSString *to) {
     [self.topBar refresh];
     self.backButton.enabled = self.tab.back.count > 0;
     self.forwardButton.enabled = self.tab.forward.count > 0;
+}
+
+- (void)countWords:(NSString *)text {
+    NSUInteger gen = ++self.wordGen;
+    NSString *copy = [text copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSUInteger w = WordCount(copy);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (gen != self.wordGen) return;
+            self.words = w;
+            [self updateStatus];
+        });
+    });
 }
 
 - (void)updateStatus {
@@ -1998,35 +2343,98 @@ static NSDictionary *FoldAttrs(void) {
     if (self.styling || !(mask & NSTextStorageEditedCharacters)) return;
     self.styling = YES;
     NSString *s = ts.string;
+    NSUInteger len = s.length;
     NSRange oldFront = self.front;
     NSUInteger oldBlocks = self.blocks.count;
     self.front = FrontMatter(s);
     self.blocks = CodeBlocks(s, self.front);
-    NSRange lineRange = [s lineRangeForRange:NSMakeRange(MIN(edited.location, s.length), MIN(edited.length, s.length - MIN(edited.location, s.length)))];
+    if (self.loading) {
+        // Long notes: style what you'll see first, the rest a slice at a time.
+        if (len > 60000) {
+            NSUInteger f = MIN(self.styleFocus, len);
+            NSUInteger from = f > 30000 ? f - 30000 : 0, to = MIN(len, f + 30000);
+            StyleRange(ts, NSMakeRange(from, to - from), self.blocks, self.front);
+            NSUInteger gen = ++self.styleGen;
+            self.chunkPos = 0;
+            NSRange done = [s lineRangeForRange:NSMakeRange(from, to - from)];
+            dispatch_async(dispatch_get_main_queue(), ^{ [self styleSliceGen:gen skip:done]; });
+        } else {
+            StyleRange(ts, NSMakeRange(0, len), self.blocks, self.front);
+        }
+        self.styling = NO;
+        return;
+    }
+    if (self.chunkPos > edited.location) self.chunkPos = (NSUInteger)MAX(0, (NSInteger)self.chunkPos + delta);
+    NSRange lineRange = [s lineRangeForRange:NSMakeRange(MIN(edited.location, len), MIN(edited.length, len - MIN(edited.location, len)))];
     NSString *touched = [s substringWithRange:lineRange];
-    BOOL full = self.loading || self.blocks.count != oldBlocks || oldFront.location != self.front.location ||
+    BOOL full = self.blocks.count != oldBlocks || oldFront.location != self.front.location ||
                 (self.front.location != NSNotFound && NSMaxRange(oldFront) != NSMaxRange(self.front)) ||
                 [touched containsString:@"```"] || [touched containsString:@"~~~"];
     // A line inside a code block changes how far that block reaches when fences are typed; restyle the block too.
     if (!full) for (NSValue *v in self.blocks) if (NSIntersectionRange(v.rangeValue, lineRange).length) { lineRange = NSUnionRange(lineRange, v.rangeValue); }
-    StyleRange(ts, full ? NSMakeRange(0, s.length) : lineRange, self.blocks, self.front);
-    if (self.loading) { self.styling = NO; return; }
+    NSRange styled = full ? NSMakeRange(0, len) : lineRange;
+    StyleRange(ts, styled, self.blocks, self.front);
     // Recompute folds now, before the layout manager regenerates glyphs for the edit.
     NSArray<NSValue *> *old = self.hidden;
     [self computeStructure];
-    if (old.count != self.hidden.count) StyleRange(ts, NSMakeRange(0, s.length), self.blocks, self.front);   // a fold went away: restore its text
+    BOOL same = old.count == self.hidden.count;
+    for (NSUInteger i = 0; same && i < old.count; i++) {
+        NSRange o = old[i].rangeValue;
+        if (o.location >= edited.location) o.location = (NSUInteger)MAX(0, (NSInteger)o.location + delta);
+        if (!NSEqualRanges(o, self.hidden[i].rangeValue)) same = NO;
+    }
+    if (same) {
+        // Folds only moved with the text: just keep them collapsed where we restyled.
+        for (NSValue *v in self.hidden) {
+            NSRange x = NSIntersectionRange(v.rangeValue, [s lineRangeForRange:styled]);
+            if (x.length) [ts setAttributes:FoldAttrs() range:x];
+        }
+        self.styling = NO;
+        return;
+    }
+    if (old.count != self.hidden.count) StyleRange(ts, NSMakeRange(0, len), self.blocks, self.front);   // a fold went away: restore its text
     [self applyFoldAttributes:ts];
     self.styling = NO;
-    if (old.count || self.hidden.count) {
-        NSMutableArray *rs = [old mutableCopy];
-        [rs addObjectsFromArray:self.hidden];
-        dispatch_async(dispatch_get_main_queue(), ^{ [self invalidateRanges:rs all:NO]; });
+    NSMutableArray *rs = [old mutableCopy];
+    [rs addObjectsFromArray:self.hidden];
+    dispatch_async(dispatch_get_main_queue(), ^{ [self invalidateRanges:rs all:NO]; });
+}
+
+// Background styling of a long note, 25k characters per main-loop turn.
+- (void)styleSliceGen:(NSUInteger)gen skip:(NSRange)done {
+    if (gen != self.styleGen) return;
+    NSTextStorage *ts = self.textView.textStorage;
+    NSString *s = ts.string;
+    NSUInteger len = s.length;
+    if (self.chunkPos >= len) {   // finished: one clean layout pass so nothing keeps a half-styled shape
+        [self invalidateRanges:@[] all:YES];
+        return;
     }
+    NSUInteger from = self.chunkPos, to = MIN(len, from + 25000);
+    NSRange r = [s lineRangeForRange:NSMakeRange(from, to - from)];
+    self.chunkPos = NSMaxRange(r);
+    if (!NSEqualRanges(NSIntersectionRange(r, done), r)) {
+        self.styling = YES;
+        [ts beginEditing];
+        StyleRange(ts, r, self.blocks, self.front);
+        for (NSValue *v in self.hidden) {
+            NSRange x = NSIntersectionRange(v.rangeValue, r);
+            if (x.length) [ts setAttributes:FoldAttrs() range:x];
+        }
+        [ts endEditing];
+        self.styling = NO;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{ [self styleSliceGen:gen skip:done]; });
 }
 
 - (void)computeStructure {
     NSString *s = self.textView.string;
     self.headings = Headings(s, self.blocks, self.front);
+    self.lineStarts = gLineNumbers ? LineStarts(s) : nil;
+    if (self.outlineShown) {
+        [NSObject cancelPreviousPerformRequestsWithTarget:self.outlinePanel selector:@selector(reload) object:nil];
+        [self.outlinePanel performSelector:@selector(reload) withObject:nil afterDelay:0.2];
+    }
     NSMutableArray *hid = [NSMutableArray array];
     NSRange last = NSMakeRange(NSNotFound, 0);
     for (QHeading *h in self.headings) {
@@ -2056,24 +2464,31 @@ static NSDictionary *FoldAttrs(void) {
     self.textView.needsDisplay = YES;
 }
 
-// Recompute headings and folds, then re-lay-out whatever changed.
+// Recompute headings and folds, then re-lay-out only what changed.
 - (void)refreshStructureInvalidating:(BOOL)force {
     NSArray<NSValue *> *old = self.hidden;
     [self computeStructure];
+    NSSet *oldSet = [NSSet setWithArray:old], *newSet = [NSSet setWithArray:self.hidden];
     NSTextStorage *ts = self.textView.textStorage;
     NSUInteger len = ts.length;
+    NSMutableArray *changed = [NSMutableArray array];
     self.styling = YES;
     [ts beginEditing];
     for (NSValue *v in old) {   // bring back text that was folded
+        if ([newSet containsObject:v]) continue;
         NSRange r = NSIntersectionRange(v.rangeValue, NSMakeRange(0, len));
         if (r.length) StyleRange(ts, r, self.blocks, self.front);
+        [changed addObject:v];
     }
-    [self applyFoldAttributes:ts];
+    for (NSValue *v in self.hidden) {
+        if (!force && [oldSet containsObject:v] && ![changed count]) continue;
+        NSRange r = NSIntersectionRange(v.rangeValue, NSMakeRange(0, len));
+        if (r.length) [ts setAttributes:FoldAttrs() range:r];
+        if (![oldSet containsObject:v]) [changed addObject:v];
+    }
     [ts endEditing];
     self.styling = NO;
-    NSMutableArray *rs = [old mutableCopy];
-    [rs addObjectsFromArray:self.hidden];
-    [self invalidateRanges:rs all:force];
+    [self invalidateRanges:changed all:force];
 }
 
 - (BOOL)isHiddenChar:(NSUInteger)ci {
@@ -2099,7 +2514,6 @@ static NSDictionary *FoldAttrs(void) {
         else if (ci < s.length) {
             unichar c = [s characterAtIndex:ci];
             if ((c == '-' || c == '*' || c == '+') && [ts attribute:QBulletAttr atIndex:ci effectiveRange:NULL]) touch = YES;
-            else if ((c == '#' || c == ' ' || c == '\t') && [ts attribute:QMarkerAttr atIndex:ci effectiveRange:NULL]) touch = YES;
         }
     }
     if (!touch) return 0;
@@ -2113,10 +2527,6 @@ static NSDictionary *FoldAttrs(void) {
     for (NSUInteger i = 0; i < n; i++) {
         NSUInteger ci = charIndexes[i];
         if ([self isHiddenChar:ci]) { p[i] = NSGlyphPropertyNull; continue; }
-        if (ci < s.length && !NSLocationInRange(ci, self.activeLine) && [ts attribute:QMarkerAttr atIndex:ci effectiveRange:NULL]) {
-            p[i] = NSGlyphPropertyNull;   // "### " disappears until the caret is on this line
-            continue;
-        }
         if (ci < s.length && bulletGlyph) {
             unichar c = [s characterAtIndex:ci];
             if ((c == '-' || c == '*' || c == '+') && [ts attribute:QBulletAttr atIndex:ci effectiveRange:NULL]) g[i] = bulletGlyph;
@@ -2231,25 +2641,34 @@ static NSDictionary *FoldAttrs(void) {
 
 - (void)updateActiveLine {
     NSString *s = self.textView.string;
-    NSRange sel = self.textView.selectedRange;
-    NSRange line = s.length ? [s lineRangeForRange:NSMakeRange(MIN(sel.location, s.length), 0)] : NSMakeRange(0, 0);
-    if (sel.length) line = [s lineRangeForRange:NSIntersectionRange(sel, NSMakeRange(0, s.length))];
-    if (NSEqualRanges(line, self.activeLine)) return;
-    NSRange old = self.activeLine;
-    self.activeLine = line;
-    NSLayoutManager *lm = self.textView.layoutManager;
     NSUInteger len = s.length;
+    NSRange sel = self.textView.selectedRange;
+    NSRange line = len ? [s lineRangeForRange:NSIntersectionRange(NSMakeRange(MIN(sel.location, len), sel.length), NSMakeRange(0, len))] : NSMakeRange(0, 0);
+    if (NSEqualRanges(line, gActiveLine)) return;
+    NSRange old = gActiveLine;
+    gActiveLine = line;
+    // Restyle just the line the caret left and the line it entered.
+    NSTextStorage *ts = self.textView.textStorage;
+    self.styling = YES;
+    [ts beginEditing];
     for (NSValue *v in @[[NSValue valueWithRange:old], [NSValue valueWithRange:line]]) {
+        if (v.rangeValue.location == NSNotFound) continue;
         NSRange r = NSIntersectionRange(v.rangeValue, NSMakeRange(0, len));
         if (!r.length) continue;
-        [lm invalidateGlyphsForCharacterRange:r changeInLength:0 actualCharacterRange:NULL];
-        [lm invalidateLayoutForCharacterRange:r actualCharacterRange:NULL];
+        StyleRange(ts, r, self.blocks, self.front);
+        NSRange lr = [s lineRangeForRange:r];
+        for (NSValue *h in self.hidden) {
+            NSRange x = NSIntersectionRange(h.rangeValue, lr);
+            if (x.length) [ts setAttributes:FoldAttrs() range:x];
+        }
     }
-    self.textView.needsDisplay = YES;
+    [ts endEditing];
+    self.styling = NO;
 }
 
 - (void)textViewDidChangeSelection:(NSNotification *)n {
-    [self updateActiveLine];
+    dispatch_async(dispatch_get_main_queue(), ^{ [self updateActiveLine]; });
+    if (self.outlineShown) [self.outlinePanel highlight];
     NSRange sel = self.textView.selectedRange;
     if (!self.hidden.count) return;
     BOOL changed = NO;
@@ -2458,7 +2877,9 @@ static NSDictionary *FoldAttrs(void) {
             if (![fm fileExistsAtPath:p]) continue;
             t.path = p;
         }
-        [list addObject:t];
+        BOOL dup = NO;
+        for (QTab *o in list) if (t.path && [o.path isEqualToString:t.path]) dup = YES;
+        if (!dup) [list addObject:t];
     }
     if (!list.count) {   // first run with tabs: start from the last note
         QTab *t = [QTab new];
@@ -2485,6 +2906,10 @@ static NSDictionary *FoldAttrs(void) {
 
 - (void)openInNewTab:(NSString *)path {
     if (!path) return;
+    path = path.stringByStandardizingPath;
+    if ([self.tab.path isEqualToString:path]) return;
+    NSInteger other = [self tabIndexForPath:path];
+    if (other >= 0) { [self selectTab:other]; return; }
     [self saveNow];
     [self rememberCaret];
     [self.tabs insertObject:[QTab new] atIndex:(NSUInteger)self.active + 1];
@@ -2544,42 +2969,48 @@ static NSDictionary *FoldAttrs(void) {
     [self.topBar refresh];
 }
 
+#pragma mark Outline and theme
+
+- (void)revealHeading:(NSInteger)i {
+    if (i < 0 || (NSUInteger)i >= self.headings.count) return;
+    QHeading *h = self.headings[(NSUInteger)i];
+    BOOL changed = NO;
+    for (QHeading *o in self.headings)
+        if ([self.folded containsObject:o.key] && NSLocationInRange(h.line.location, o.hide)) { [self.folded removeObject:o.key]; changed = YES; }
+    if (changed) [self afterFoldChange];
+    [self.view.window makeFirstResponder:self.textView];
+    self.textView.selectedRange = NSMakeRange(NSMaxRange(h.line), 0);
+    [self.textView.layoutManager ensureLayoutForCharacterRange:NSMakeRange(0, MIN(self.textView.string.length, NSMaxRange(h.line) + 1))];
+    NSRect r = [self.textView lineRectForChar:h.line.location used:NO];
+    NSClipView *clip = self.scroll.contentView;
+    CGFloat maxY = MAX(0, NSHeight(self.textView.frame) - NSHeight(clip.bounds));
+    [clip scrollToPoint:NSMakePoint(0, MIN(maxY, MAX(0, NSMinY(r) - 60)))];
+    [self.scroll reflectScrolledClipView:clip];
+}
+
+- (void)toggleOutline {
+    self.outlineShown = !self.outlineShown;
+    [Defaults() setBool:self.outlineShown forKey:kOutlineShown];
+    if (self.outlineShown) [self.outlinePanel reload];
+    [self layout];
+}
+
+- (void)applyTheme {
+    self.view.layer.backgroundColor = qDesk.CGColor;
+    self.scroll.backgroundColor = qDesk;
+    self.textView.backgroundColor = qDesk;
+    self.textView.insertionPointColor = qHead;
+    self.textView.titleField.textColor = qHead;
+    self.status.textColor = qFaint;
+    [self.topBar refresh];
+    self.canvas.needsDisplay = YES;
+    [self.outlinePanel applyTheme];
+    if (self.path && ![self isCanvasPath:self.path]) [self computeStructure];
+}
+
 @end
 
 #pragma mark - Sidebar rows
-
-@interface QRowView : NSTableRowView
-@property NSInteger level;
-@property BOOL current, hover;
-@property CGFloat guideBase, indent;
-@end
-
-@implementation QRowView
-- (void)drawBackgroundInRect:(NSRect)r {
-    [qSide setFill];
-    NSRectFill(r);
-    NSRect box = NSInsetRect(self.bounds, 8, 1);
-    if (self.current) RoundRect(box, 6, qSideSel);
-    else if (self.hover) RoundRect(box, 6, qSideHover);
-    if (self.level > 0 && self.indent > 0) {
-        [Hex(0x2a2a2a) setFill];
-        for (NSInteger k = 0; k < self.level; k++) {
-            CGFloat x = round(self.guideBase + k * self.indent);
-            NSRectFill(NSMakeRect(x, 0, 1, NSHeight(self.bounds)));
-        }
-    }
-}
-- (void)drawSelectionInRect:(NSRect)r {}
-- (BOOL)isEmphasized { return NO; }
-- (void)updateTrackingAreas {
-    [super updateTrackingAreas];
-    for (NSTrackingArea *ta in self.trackingAreas.copy) [self removeTrackingArea:ta];
-    [self addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
-        options:NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect owner:self userInfo:nil]];
-}
-- (void)mouseEntered:(NSEvent *)e { self.hover = YES; self.needsDisplay = YES; }
-- (void)mouseExited:(NSEvent *)e { self.hover = NO; self.needsDisplay = YES; }
-@end
 
 @interface QTreeCell : NSTableCellView
 @property (strong) NSTextField *badge;
@@ -2746,9 +3177,24 @@ static NSDictionary *FoldAttrs(void) {
     [self addSubview:self.gearButton];
 
     self.filesTab.active = YES;
+    Clip(self);
     [self refreshFooter];
     [self place];
     return self;
+}
+
+- (void)applyTheme {
+    self.layer.backgroundColor = qSide.CGColor;
+    self.outline.backgroundColor = qSide;
+    self.outlineScroll.backgroundColor = qSide;
+    self.results.backgroundColor = qSide;
+    self.resultScroll.backgroundColor = qSide;
+    for (QIconButton *b in @[self.filesTab, self.searchTab, self.hideButton, self.noteButton, self.folderButton, self.sortButton, self.collapseButton, self.gearButton])
+        [b refreshTint];
+    [self refreshFooter];
+    [self reload];
+    [self.results reloadData];
+    self.needsDisplay = YES;
 }
 
 - (void)refreshFooter {
@@ -2788,7 +3234,7 @@ static NSDictionary *FoldAttrs(void) {
 - (void)drawRect:(NSRect)r {
     [qSide setFill];
     NSRectFill(r);
-    [Hex(0x1f1f1f) setFill];
+    [Hex(gLook == 1 ? 0x333333 : 0x1f1f1f) setFill];
     NSRectFill(NSMakeRect(0, NSHeight(self.bounds) - 44, NSWidth(self.bounds), 1));
 }
 
@@ -4146,7 +4592,8 @@ static QSettings *gSettings;
 
 @interface QSettings ()
 @property (strong) NSTextField *vaultLabel, *dateField, *datePreview;
-@property (strong) NSPopUpButton *sizePop, *widthPop, *placePop;
+@property (strong) NSPopUpButton *sizePop, *widthPop, *placePop, *lookPop;
+@property (strong) NSButton *numbersBox;
 @end
 
 @implementation QSettings
@@ -4159,7 +4606,7 @@ static QSettings *gSettings;
 }
 
 - (instancetype)init {
-    NSWindow *w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 580, 430)
+    NSWindow *w = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 580, 500)
                                               styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                                                 backing:NSBackingStoreBuffered defer:NO];
     w.title = @"Settings";
@@ -4168,7 +4615,7 @@ static QSettings *gSettings;
     w.releasedWhenClosed = NO;
     [w center];
     if (!(self = [super initWithWindow:w])) return nil;
-    QFlip *v = [[QFlip alloc] initWithFrame:NSMakeRect(0, 0, 580, 430)];
+    QFlip *v = [[QFlip alloc] initWithFrame:NSMakeRect(0, 0, 580, 500)];
     w.contentView = v;
 
     CGFloat lx = 28, cx = 168, cw = 380, y = 26;
@@ -4208,7 +4655,19 @@ static QSettings *gSettings;
     [self.placePop addItemsWithTitles:@[@"Next to the open note", @"At the top of the vault"]];
     self.placePop.target = self; self.placePop.action = @selector(changed:);
     [v addSubview:self.placePop];
-    y += 52;
+    y += 40;
+
+    row(@"Look", y);
+    self.lookPop = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(cx, y - 1, 260, 26) pullsDown:NO];
+    [self.lookPop addItemsWithTitles:@[@"Quire (serif, dotted desk)", @"Obsidian (sans, flat grey)"]];
+    self.lookPop.target = self; self.lookPop.action = @selector(lookChanged:);
+    [v addSubview:self.lookPop];
+    y += 36;
+
+    self.numbersBox = [NSButton checkboxWithTitle:@"Show line numbers" target:self action:@selector(lookChanged:)];
+    self.numbersBox.frame = NSMakeRect(cx, y, 240, 22);
+    [v addSubview:self.numbersBox];
+    y += 48;
 
     row(@"Date (⌘D)", y);
     self.dateField = [[NSTextField alloc] initWithFrame:NSMakeRect(cx, y, 200, 24)];
@@ -4236,6 +4695,8 @@ static QSettings *gSettings;
     double w = [Defaults() doubleForKey:kPageWidth];
     [self.widthPop selectItemAtIndex:w <= 0 ? 4 : w <= 610 ? 0 : w <= 690 ? 1 : w <= 790 ? 2 : 3];
     [self.placePop selectItemAtIndex:[Defaults() integerForKey:kNewNoteLoc] ? 1 : 0];
+    [self.lookPop selectItemAtIndex:[Defaults() integerForKey:kLook] == 1 ? 1 : 0];
+    self.numbersBox.state = [Defaults() boolForKey:kLineNumbers] ? NSControlStateValueOn : NSControlStateValueOff;
     self.dateField.stringValue = [Defaults() stringForKey:kDateFmt] ?: @"";
     [self previews];
 }
@@ -4250,6 +4711,13 @@ static QSettings *gSettings;
     [Defaults() setObject:widths[(NSUInteger)MAX(0, self.widthPop.indexOfSelectedItem)] forKey:kPageWidth];
     [Defaults() setInteger:self.placePop.indexOfSelectedItem forKey:kNewNoteLoc];
     [gApp.editor applySettings];
+}
+
+- (void)lookChanged:(id)sender {
+    [Defaults() setInteger:self.lookPop.indexOfSelectedItem forKey:kLook];
+    [Defaults() setBool:self.numbersBox.state == NSControlStateValueOn forKey:kLineNumbers];
+    [gApp applyLook];
+    self.window.backgroundColor = qSide;
 }
 
 - (void)controlTextDidChange:(NSNotification *)n {
@@ -4407,6 +4875,20 @@ static QSettings *gSettings;
     return p;
 }
 
+- (void)applyLook {
+    gLook = [Defaults() integerForKey:kLook];
+    gLineNumbers = [Defaults() boolForKey:kLineNumbers];
+    InitPalette();
+    [gFontCache removeAllObjects];
+    [gParaCache removeAllObjects];
+    self.window.backgroundColor = qDesk;
+    [self.sidebar applyTheme];
+    [self.editor applyTheme];
+    [self.editor applySettings];
+}
+
+- (void)toggleOutline:(id)s { [self.editor toggleOutline]; }
+
 #pragma mark Sidebar
 
 - (void)toggleSidebar:(id)sender {
@@ -4554,6 +5036,7 @@ static QSettings *gSettings;
     [self item:@"Hide Sidebar" action:@selector(toggleSidebar:) key:@"\\" mods:C in:view];
     [self item:@"Files" action:@selector(showFilesTab:) key:@"e" mods:C | S in:view];
     [self item:@"Search" action:@selector(showSearch:) key:@"f" mods:C | S in:view];
+    [self item:@"Outline" action:@selector(toggleOutline:) key:@"o" mods:C | O in:view];
     [view addItem:NSMenuItem.separatorItem];
     [self item:@"Fold Heading" action:@selector(foldHeading:) key:@"[" mods:C | O in:view];
     [self item:@"Unfold Heading" action:@selector(unfoldHeading:) key:@"]" mods:C | O in:view];
@@ -4596,6 +5079,8 @@ int main(int argc, const char *argv[]) {
             kDateFmt: @"yyyy-MM-dd",
         }];
         gBase = [Defaults() doubleForKey:kFontSize];
+        gLook = [Defaults() integerForKey:kLook];
+        gLineNumbers = [Defaults() boolForKey:kLineNumbers];
         InitPalette();
         InitRegexes();
         NSApplication *app = NSApplication.sharedApplication;
