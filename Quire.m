@@ -266,6 +266,7 @@ typedef NS_ENUM(NSInteger, QSort) { QSortNameAZ, QSortNameZA, QSortModNew, QSort
 
 @interface QEditor : NSObject <NSTextStorageDelegate, NSTextViewDelegate, NSLayoutManagerDelegate, NSTextFieldDelegate>
 @property (strong) NSView *view;
+- (void)scheduleSpellCheck;
 @property (strong) QTextView *textView;
 @property (strong) NSScrollView *scroll;
 @property (strong) QCanvasView *canvas;
@@ -1488,6 +1489,12 @@ static NSString *TodayString(NSString *fmt) {
 }
 
 // ⌘D: type today's date at the caret.
+- (void)toggleContinuousSpellChecking:(id)sender {
+    [super toggleContinuousSpellChecking:sender];
+    [Defaults() setBool:self.continuousSpellCheckingEnabled forKey:@"quireSpellCheck"];
+    if (self.continuousSpellCheckingEnabled) [self.editor scheduleSpellCheck];
+}
+
 - (void)insertDate:(id)sender {
     NSString *d = TodayString([Defaults() stringForKey:kDateFmt]);
     if (d.length) [self insertText:d replacementRange:self.selectedRange];
@@ -1876,7 +1883,7 @@ static NSString *TodayString(NSString *fmt) {
 @interface QEditor ()
 @property (strong) NSArray<NSValue *> *blocks;
 @property NSRange front;
-@property BOOL styling, loading;
+@property BOOL styling, loading, spellPending;
 @property (strong) NSTimer *saveTimer;
 @property (strong) NSDate *savedMtime;
 @property NSUInteger words, chars, wordGen, styleGen, styleFocus, chunkPos;
@@ -1940,6 +1947,7 @@ static NSString *TodayString(NSString *fmt) {
     sv.backgroundColor = qDesk;
     sv.borderType = NSNoBorder;
     sv.contentView.postsBoundsChangedNotifications = YES;
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(scheduleSpellCheck) name:NSViewBoundsDidChangeNotification object:sv.contentView];
 
     QTextView *tv = [[QTextView alloc] initWithFrame:NSMakeRect(0, 0, 900, 660) textContainer:tc];
     tv.editor = self;
@@ -1959,7 +1967,10 @@ static NSString *TodayString(NSString *fmt) {
     tv.automaticDashSubstitutionEnabled = NO;
     tv.automaticTextReplacementEnabled = NO;
     tv.automaticSpellingCorrectionEnabled = NO;
-    tv.continuousSpellCheckingEnabled = YES;
+    // Red underlines for misspellings. AppKit can switch these off app-wide (NSAllowContinuousSpellChecking)
+    // and that had happened here, so Quire keeps its own on/off setting (Edit ▸ Spelling and Grammar).
+    [Defaults() setBool:YES forKey:@"NSAllowContinuousSpellChecking"];
+    tv.continuousSpellCheckingEnabled = [Defaults() objectForKey:@"quireSpellCheck"] ? [Defaults() boolForKey:@"quireSpellCheck"] : YES;
     tv.smartInsertDeleteEnabled = NO;
     tv.drawsBackground = YES;
     tv.backgroundColor = qDesk;
@@ -2395,6 +2406,7 @@ static NSDictionary *FoldAttrs(void) {
 
 - (void)textStorage:(NSTextStorage *)ts didProcessEditing:(NSTextStorageEditActions)mask range:(NSRange)edited changeInLength:(NSInteger)delta {
     if (self.styling || !(mask & NSTextStorageEditedCharacters)) return;
+    [self scheduleSpellCheck];
     self.styling = YES;
     NSString *s = ts.string;
     NSUInteger len = s.length;
@@ -2460,6 +2472,7 @@ static NSDictionary *FoldAttrs(void) {
 // Background styling of a long note, 25k characters per main-loop turn.
 - (void)styleSliceGen:(NSUInteger)gen skip:(NSRange)done {
     if (gen != self.styleGen) return;
+    [self scheduleSpellCheck];
     NSTextStorage *ts = self.textView.textStorage;
     NSString *s = ts.string;
     NSUInteger len = s.length;
@@ -2737,6 +2750,29 @@ static NSDictionary *FoldAttrs(void) {
     }
     [ts endEditing];
     self.styling = NO;
+    [self scheduleSpellCheck];
+}
+
+// Spelling. Restyling a line resets the layout manager's marks, so the red underlines would vanish
+// (and text that was loaded, not typed, is never checked). Re-check what's on screen after each
+// edit, restyle and scroll, a moment later so typing stays smooth.
+- (void)scheduleSpellCheck {
+    if (self.spellPending) return;
+    self.spellPending = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        self.spellPending = NO;
+        [self spellCheckVisible];
+    });
+}
+- (void)spellCheckVisible {
+    QTextView *tv = self.textView;
+    if (!tv.window || !tv.continuousSpellCheckingEnabled || self.loading || self.styling) return;
+    NSString *s = tv.string;
+    NSRange r = NSIntersectionRange([tv visibleCharRange:tv.visibleRect], NSMakeRange(0, s.length));
+    if (!r.length) return;
+    if (r.length > 6000) r.length = 6000;   // before layout settles the "visible" range can be the whole note
+    r = [s lineRangeForRange:r];
+    [tv checkTextInRange:r types:NSTextCheckingTypeSpelling options:@{}];
 }
 
 - (void)textViewDidChangeSelection:(NSNotification *)n {
@@ -5370,6 +5406,13 @@ static QSettings *gSettings;
     [self item:@"Use Selection for Find" action:@selector(performTextFinderAction:) key:@"e" mods:C in:find].tag = NSTextFinderActionSetSearchString;
     [edit addItemWithTitle:@"Find" action:nil keyEquivalent:@""].submenu = find;
     [self item:@"Search All Notes" action:@selector(showSearch:) key:@"f" mods:C | S in:edit];
+    [edit addItem:NSMenuItem.separatorItem];
+    NSMenu *spell = [[NSMenu alloc] initWithTitle:@"Spelling and Grammar"];
+    [self item:@"Show Spelling and Grammar" action:@selector(showGuessPanel:) key:@":" mods:C in:spell];
+    [self item:@"Check Document Now" action:@selector(checkSpelling:) key:@";" mods:C in:spell];
+    [spell addItem:NSMenuItem.separatorItem];
+    [self item:@"Check Spelling While Typing" action:@selector(toggleContinuousSpellChecking:) key:nil mods:0 in:spell];
+    [edit addItemWithTitle:@"Spelling and Grammar" action:nil keyEquivalent:@""].submenu = spell;
     [bar addItemWithTitle:@"" action:nil keyEquivalent:@""].submenu = edit;
 
     NSMenu *fmt = [[NSMenu alloc] initWithTitle:@"Format"];
