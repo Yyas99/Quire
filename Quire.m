@@ -5051,7 +5051,7 @@ static QSettings *gSettings;
 
     row(@"Look", y);
     self.lookPop = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(cx, y - 1, 260, 26) pullsDown:NO];
-    [self.lookPop addItemsWithTitles:@[@"Quire (serif, dotted desk)", @"Obsidian (sans, flat grey)"]];
+    [self.lookPop addItemsWithTitles:@[@"Quire (serif, dotted desk)", @"Flat (sans, grey)"]];
     self.lookPop.target = self; self.lookPop.action = @selector(lookChanged:);
     [v addSubview:self.lookPop];
     y += 36;
